@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "drivers": {
+    "granville-llama": {
+      "description": "llama.cpp backend for GGUF model inference",
+      "repo": "https://github.com/rjpruitt16/granville-llama",
+      "official": true,
+      "latest_version": "0.1.0",
+      "platforms": [
+        "darwin-arm64",
+        "darwin-x86_64",
+        "linux-arm64",
+        "linux-x86_64",
+        "windows-x86_64"
+      ],
+      "capabilities": ["text-generation", "embeddings"]
+    }
+  },
+  "naming_convention": {
+    "official": "granville-<backend>",
+    "community": "<vendor>-granville-<name>"
+  }
+}

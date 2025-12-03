@@ -1,0 +1,29 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+zig-cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Poetry
+poetry.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test sockets
+/tmp/
+
+# Local models (large files)
+*.gguf

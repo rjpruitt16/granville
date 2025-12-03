@@ -1,0 +1,70 @@
+name: Unit Tests
+
+run-name: "🧪 Unit Tests · ${{ github.event_name == 'schedule' && 'Scheduled (master)' || (github.event_name == 'workflow_dispatch' && 'Manual Run' || github.event.workflow_run.head_branch) }}"
+
+on:
+    schedule:
+        # 每天凌晨 2 点执行
+        - cron: "0 2 * * *"
+    workflow_dispatch:
+    workflow_run:
+        workflows: ["Code Format Check"]
+        types:
+            - completed
+
+jobs:
+    test:
+        name: Unit Test (${{ matrix.os }} - ${{ matrix.arch }} - Zig ${{ matrix.version }})
+        # 依赖 format check 成功，或定时任务/手动触发时执行
+        if: |
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+        strategy:
+            matrix:
+                # 架构配置标识符
+                arch_config: [linux-x86_64, linux-aarch64, macos-x86_64, macos-arm64, windows-x86_64]
+                # 定时任务只测试 master 版本，其他情况测试所有版本
+                version: ${{ github.event_name == 'schedule' && fromJSON('["master"]') || fromJSON('["0.14.1", "0.15.1", "master"]') }}
+                include:
+                    # Linux x86_64
+                    - arch_config: linux-x86_64
+                      os: ubuntu-latest
+                      arch: x86_64
+                      runner: ubuntu-latest
+                    # Linux aarch64
+                    - arch_config: linux-aarch64
+                      os: ubuntu-latest
+                      arch: aarch64
+                      runner: ubuntu-24.04-arm
+                    # macOS x86_64
+                    - arch_config: macos-x86_64
+                      os: macos-latest
+                      arch: x86_64
+                      runner: macos-13
+                    # macOS arm64
+                    - arch_config: macos-arm64
+                      os: macos-latest
+                      arch: arm64
+                      runner: macos-14
+                    # Windows x86_64
+                    - arch_config: windows-x86_64
+                      os: windows-latest
+                      arch: x86_64
+                      runner: windows-latest
+            fail-fast: false
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup Zig
+              uses: goto-bus-stop/setup-zig@v2
+              with:
+                  version: ${{ matrix.version }}
+
+            - name: Run unit tests
+              run: zig build test --summary all
+

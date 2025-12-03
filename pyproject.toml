@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "granville-tests"
+version = "0.1.0"
+description = "Integration tests for Granville inference kernel"
+authors = ["Layer8"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.9"
+msgpack = "^1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
