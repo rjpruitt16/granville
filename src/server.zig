@@ -173,14 +173,27 @@ const WindowsNamedPipe = struct {
     }
 };
 
-/// Classification prompt for ranking requests
+/// Classification prompt for ranking requests with PII redaction
 const RANK_PROMPT =
-    \\Classify this task's urgency. Reply with exactly one word: CRITICAL, HIGH, NORMAL, or LOW.
+    \\Classify this task's urgency AND redact any PII (personally identifiable information).
     \\
+    \\Reply in this exact format:
+    \\PRIORITY: <CRITICAL|HIGH|NORMAL|LOW>
+    \\REDACTED: <task with PII replaced>
+    \\
+    \\Priority levels:
     \\CRITICAL = System emergency, security issue, data loss risk
     \\HIGH = Time-sensitive, blocking other work, customer-facing issue
     \\NORMAL = Regular task, can wait a bit
     \\LOW = Background task, nice-to-have, no deadline
+    \\
+    \\PII to redact (replace with placeholders):
+    \\- Email addresses -> [EMAIL]
+    \\- Phone numbers -> [PHONE]
+    \\- SSN/ID numbers -> [SSN]
+    \\- Names of people -> [NAME]
+    \\- Addresses -> [ADDRESS]
+    \\- Credit card numbers -> [CARD]
     \\
     \\Task:
 ;

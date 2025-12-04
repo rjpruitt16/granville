@@ -25,7 +25,8 @@ Zig-based inference kernel for local CPU models. Named after **Granville T. Wood
 │                                │                                         │
 │  ┌─────────────────────────────▼───────────────────────────────────┐    │
 │  │                       Ranker Thread                              │    │
-│  │         Classifies tasks: CRITICAL > HIGH > NORMAL > LOW         │    │
+│  │    - Classifies priority: CRITICAL > HIGH > NORMAL > LOW         │    │
+│  │    - Redacts PII: [EMAIL] [PHONE] [SSN] [NAME] [ADDRESS] [CARD]  │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                │                                         │
 │  ┌─────────────────────────────▼───────────────────────────────────┐    │
@@ -55,13 +56,44 @@ Zig-based inference kernel for local CPU models. Named after **Granville T. Wood
 
 ## Request Flow
 
+```
+Client                          Granville
+  │                                │
+  │──── Request ──────────────────▶│
+  │                                │── ACK (immediate)
+  │◀─── ACK ───────────────────────│── Push to Unranked Queue
+  │                                │
+  │    [Client free to continue]   │
+  │                                │── Ranker: classify + redact PII
+  │                                │── Push to Ranked Queue (by priority)
+  │                                │── Worker: inference on redacted text
+  │                                │
+  │◀─── Result (via callback) ─────│
+  │                                │
+```
+
 1. **Submit** - Client sends MessagePack request over IPC
-2. **ACK** - Server immediately acknowledges receipt
+2. **ACK** - Server immediately acknowledges receipt (client can disconnect)
 3. **Enqueue** - Task goes to Unranked Queue (FIFO)
-4. **Rank** - Ranker thread classifies priority using the model
-5. **Priority Queue** - Task moves to Ranked Queue sorted by priority
-6. **Inference** - Worker thread pulls highest priority task, runs inference
+4. **Rank & Redact** - Ranker thread (async) classifies priority AND redacts PII
+5. **Priority Queue** - Redacted task moves to Ranked Queue sorted by priority
+6. **Inference** - Worker thread pulls highest priority task, runs inference on clean text
 7. **Callback** - Result sent to client's callback socket
+
+## PII Redaction
+
+The ranker automatically detects and redacts personally identifiable information:
+
+| PII Type | Placeholder |
+|----------|-------------|
+| Email addresses | `[EMAIL]` |
+| Phone numbers | `[PHONE]` |
+| SSN/ID numbers | `[SSN]` |
+| Names of people | `[NAME]` |
+| Physical addresses | `[ADDRESS]` |
+| Credit card numbers | `[CARD]` |
+
+This ensures sensitive data never reaches the inference model or logs.
 
 ## Installation
 

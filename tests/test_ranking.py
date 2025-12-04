@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Test ranking functionality.
-Every task should be ranked before being processed.
+Test ranking and PII redaction functionality.
+Every task should be ranked and have PII redacted before being processed.
 
 Run with: poetry run python tests/test_ranking.py
 """
@@ -21,7 +21,7 @@ def cleanup_sockets():
     except FileNotFoundError:
         pass
 
-def test_ranking(text: str, expected_priority: str):
+def test_ranking(text: str, expected_priority: str, should_redact: bool = False):
     """Send a task with ranked=True and see what priority gets assigned"""
     cleanup_sockets()
 
@@ -42,7 +42,7 @@ def test_ranking(text: str, expected_priority: str):
             'id': str(uuid.uuid4()),
             'text': text,
             'callback': CALLBACK_PATH,
-            'ranked': True,  # Ask server to rank this task
+            'ranked': True,  # Ask server to rank this task and redact PII
             # No 'priority' field - server should determine it
         }
         client.send(msgpack.packb(request))
@@ -62,6 +62,12 @@ def test_ranking(text: str, expected_priority: str):
         priority = result.get('priority', 'unknown')
         print(f"  Priority assigned: {priority} (expected: {expected_priority})")
 
+        # Check if PII was redacted in the response (if applicable)
+        if should_redact:
+            response_text = result.get('tool_input_json', '')
+            has_redaction = any(tag in response_text for tag in ['[EMAIL]', '[PHONE]', '[SSN]', '[NAME]', '[ADDRESS]', '[CARD]'])
+            print(f"  PII redaction detected: {has_redaction}")
+
         return priority
 
     finally:
@@ -69,7 +75,7 @@ def test_ranking(text: str, expected_priority: str):
         cleanup_sockets()
 
 def main():
-    print("\n=== Granville Ranking Test ===\n")
+    print("\n=== Granville Ranking & PII Redaction Test ===\n")
 
     # Check socket exists
     if not os.path.exists(SOCKET_PATH):
@@ -78,7 +84,8 @@ def main():
         return 1
 
     # Test cases with different urgency levels
-    tests = [
+    print("=== Priority Classification Tests ===")
+    priority_tests = [
         ("URGENT: Production server is DOWN! All customers affected!", "CRITICAL"),
         ("The checkout button is not working for mobile users", "HIGH"),
         ("Can you help me write a function to sort an array?", "NORMAL"),
@@ -86,10 +93,28 @@ def main():
     ]
 
     results = []
-    for text, expected in tests:
+    for text, expected in priority_tests:
         print(f"\nTesting: {text[:50]}...")
         try:
             actual = test_ranking(text, expected)
+            results.append((text, expected, actual, expected.lower() == actual.lower()))
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            results.append((text, expected, "ERROR", False))
+
+    # PII redaction tests
+    print("\n=== PII Redaction Tests ===")
+    pii_tests = [
+        ("Contact john.doe@example.com about the urgent server issue", "CRITICAL", True),
+        ("Call me at 555-123-4567 to discuss the bug", "HIGH", True),
+        ("My SSN is 123-45-6789 and I need help with my account", "CRITICAL", True),
+        ("Send the report to Jane Smith at 123 Main St, NYC", "NORMAL", True),
+    ]
+
+    for text, expected, should_redact in pii_tests:
+        print(f"\nTesting PII: {text[:50]}...")
+        try:
+            actual = test_ranking(text, expected, should_redact)
             results.append((text, expected, actual, expected.lower() == actual.lower()))
         except Exception as e:
             print(f"  FAILED: {e}")
@@ -105,7 +130,7 @@ def main():
         print(f"  [{status}] Expected {expected}, got {actual}: {text[:40]}...")
 
     print(f"\n{passed}/{len(results)} matched expectations")
-    print("\nNote: Ranking depends on model interpretation. Mismatches may be acceptable.")
+    print("\nNote: Ranking and PII redaction depend on model interpretation. Mismatches may be acceptable.")
 
     return 0
 
