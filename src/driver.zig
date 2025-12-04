@@ -309,14 +309,76 @@ pub const DriverManager = struct {
             },
             else => return err,
         };
+        errdefer std.fs.deleteTreeAbsolute(driver_dir) catch {};
 
-        // TODO: Actually download and extract the tarball
-        // For now, print instructions
-        std.debug.print("\nDriver directory created: {s}\n", .{driver_dir});
-        std.debug.print("\nTo complete installation manually:\n", .{});
-        std.debug.print("  1. Download: {s}\n", .{download_url});
-        std.debug.print("  2. Extract to: {s}\n", .{driver_dir});
-        std.debug.print("\nAutomatic download coming soon!\n", .{});
+        // Download the tarball
+        const tarball_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}.tar.gz",
+            .{ driver_dir, name },
+        );
+        defer self.allocator.free(tarball_path);
+
+        try downloadFile(self.allocator, download_url, tarball_path);
+        defer std.fs.deleteFileAbsolute(tarball_path) catch {};
+
+        // Extract the tarball
+        std.debug.print("Extracting...\n", .{});
+        try extractTarGz(self.allocator, tarball_path, driver_dir);
+
+        std.debug.print("Driver '{s}' installed successfully.\n", .{name});
+    }
+
+    /// Download a file from URL to path
+    fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+        const uri = std.Uri.parse(url) catch {
+            std.debug.print("Error: Invalid URL format\n", .{});
+            return error.InvalidUrl;
+        };
+
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        // Create an allocating writer to collect the response
+        var response_writer = std.Io.Writer.Allocating.init(allocator);
+        defer response_writer.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .uri = uri },
+            .method = .GET,
+            .response_writer = &response_writer.writer,
+        }) catch |err| {
+            std.debug.print("Error downloading: {}\n", .{err});
+            return error.DownloadFailed;
+        };
+
+        if (result.status != .ok) {
+            std.debug.print("Error: HTTP {d}\n", .{@intFromEnum(result.status)});
+            return error.DownloadFailed;
+        }
+
+        // Get the downloaded data
+        const data = response_writer.writer.buffered();
+
+        // Write to file
+        var file = try std.fs.createFileAbsolute(dest_path, .{});
+        defer file.close();
+        try file.writeAll(data);
+
+        const size_mb = @as(f64, @floatFromInt(data.len)) / (1024 * 1024);
+        std.debug.print("Downloaded {d:.2} MB\n", .{size_mb});
+    }
+
+    /// Extract a .tar.gz file to a directory
+    fn extractTarGz(allocator: std.mem.Allocator, tarball_path: []const u8, dest_dir: []const u8) !void {
+        // Use system tar command for simplicity
+        var child = std.process.Child.init(
+            &.{ "tar", "-xzf", tarball_path, "-C", dest_dir, "--strip-components=1" },
+            allocator,
+        );
+        child.cwd = null;
+
+        _ = try child.spawnAndWait();
     }
 
     /// Remove an installed driver

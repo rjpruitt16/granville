@@ -82,18 +82,33 @@ Client                          Granville
 
 ## PII Redaction
 
-The ranker automatically detects and redacts personally identifiable information:
+Granville automatically strips personally identifiable information (PII) from all ranked requests **before** they reach the inference model. This happens during the ranking step, ensuring sensitive data never touches the LLM or appears in logs.
 
-| PII Type | Placeholder |
-|----------|-------------|
-| Email addresses | `[EMAIL]` |
-| Phone numbers | `[PHONE]` |
-| SSN/ID numbers | `[SSN]` |
-| Names of people | `[NAME]` |
-| Physical addresses | `[ADDRESS]` |
-| Credit card numbers | `[CARD]` |
+### How It Works
 
-This ensures sensitive data never reaches the inference model or logs.
+When a request is submitted with `ranked: true`, the ranker thread:
+1. Analyzes the text for PII patterns
+2. Replaces detected PII with placeholder tokens
+3. Classifies the priority (CRITICAL/HIGH/NORMAL/LOW)
+4. Passes the **redacted** text to inference
+
+### Supported PII Types
+
+| PII Type | Placeholder | Example |
+|----------|-------------|---------|
+| Email addresses | `[EMAIL]` | `john@example.com` → `[EMAIL]` |
+| Phone numbers | `[PHONE]` | `555-123-4567` → `[PHONE]` |
+| SSN/ID numbers | `[SSN]` | `123-45-6789` → `[SSN]` |
+| Names of people | `[NAME]` | `John Smith` → `[NAME]` |
+| Physical addresses | `[ADDRESS]` | `123 Main St, NYC` → `[ADDRESS]` |
+| Credit card numbers | `[CARD]` | `4111-1111-1111-1111` → `[CARD]` |
+
+### Why This Matters
+
+- **Privacy by design** - Sensitive data never reaches the model
+- **Compliance ready** - Helps with GDPR, HIPAA, PCI-DSS requirements
+- **No data leakage** - PII can't appear in model responses or logs
+- **Zero latency overhead** - Redaction happens during ranking (already async)
 
 ## Installation
 

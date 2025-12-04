@@ -61,6 +61,9 @@ jobs:
       - name: Build Granville
         run: zig build -Doptimize=ReleaseFast
 
+      - name: Install llama driver
+        run: ./zig-out/bin/granville driver install granville-llama
+
       - name: Download test model
         run: |
           mkdir -p ~/.granville/models
