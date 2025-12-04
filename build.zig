@@ -33,6 +33,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Link libc for dlopen (dynamic driver loading)
+    exe.linkLibC();
+
     b.installArtifact(exe);
 
     // Run step
