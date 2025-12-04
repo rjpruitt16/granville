@@ -100,8 +100,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Config {
-    _ = allocator;
-    var args = std.process.args();
+    // Use argsWithAllocator for Windows compatibility
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
     _ = args.skip(); // Skip program name
 
     var config = Config{

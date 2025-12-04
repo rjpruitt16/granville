@@ -64,36 +64,67 @@ const UnixSocket = struct {
 
 /// Windows Named Pipe implementation
 const WindowsNamedPipe = struct {
+    const windows = std.os.windows;
+
+    // Windows named pipe constants
+    const PIPE_ACCESS_DUPLEX: windows.DWORD = 0x00000003;
+    const PIPE_TYPE_BYTE: windows.DWORD = 0x00000000;
+    const PIPE_READMODE_BYTE: windows.DWORD = 0x00000000;
+    const PIPE_WAIT: windows.DWORD = 0x00000000;
+    const PIPE_UNLIMITED_INSTANCES: windows.DWORD = 255;
+    const ERROR_PIPE_CONNECTED: windows.Win32Error = .PIPE_CONNECTED;
+
+    // External Windows API functions
+    extern "kernel32" fn CreateNamedPipeW(
+        lpName: [*:0]const u16,
+        dwOpenMode: windows.DWORD,
+        dwPipeMode: windows.DWORD,
+        nMaxInstances: windows.DWORD,
+        nOutBufferSize: windows.DWORD,
+        nInBufferSize: windows.DWORD,
+        nDefaultTimeOut: windows.DWORD,
+        lpSecurityAttributes: ?*anyopaque,
+    ) callconv(std.builtin.CallingConvention.winapi) windows.HANDLE;
+
+    extern "kernel32" fn ConnectNamedPipe(
+        hNamedPipe: windows.HANDLE,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(std.builtin.CallingConvention.winapi) windows.BOOL;
+
+    extern "kernel32" fn DisconnectNamedPipe(
+        hNamedPipe: windows.HANDLE,
+    ) callconv(std.builtin.CallingConvention.winapi) windows.BOOL;
+
     pub const Server = struct {
-        pipe_path: []const u8,
+        pipe_path_w: []const u16,
         allocator: std.mem.Allocator,
 
         pub fn deinit(self: *Server) void {
-            self.allocator.free(self.pipe_path);
+            self.allocator.free(self.pipe_path_w);
         }
 
         pub fn accept(self: *Server) !Connection {
             // Windows named pipe accept - create instance and wait
-            const handle = std.os.windows.kernel32.CreateNamedPipeA(
-                self.pipe_path.ptr,
-                std.os.windows.PIPE_ACCESS_DUPLEX,
-                std.os.windows.PIPE_TYPE_BYTE | std.os.windows.PIPE_READMODE_BYTE | std.os.windows.PIPE_WAIT,
-                std.os.windows.PIPE_UNLIMITED_INSTANCES,
+            const handle = CreateNamedPipeW(
+                @ptrCast(self.pipe_path_w.ptr),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
                 8192, // output buffer
                 8192, // input buffer
                 0, // default timeout
                 null, // security attributes
             );
 
-            if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+            if (handle == windows.INVALID_HANDLE_VALUE) {
                 return error.CreatePipeFailed;
             }
 
             // Wait for client connection
-            if (std.os.windows.kernel32.ConnectNamedPipe(handle, null) == 0) {
-                const err = std.os.windows.kernel32.GetLastError();
-                if (err != std.os.windows.ERROR_PIPE_CONNECTED) {
-                    std.os.windows.kernel32.CloseHandle(handle);
+            if (ConnectNamedPipe(handle, null) == 0) {
+                const err = windows.GetLastError();
+                if (err != ERROR_PIPE_CONNECTED) {
+                    windows.CloseHandle(handle);
                     return error.ConnectPipeFailed;
                 }
             }
@@ -103,67 +134,57 @@ const WindowsNamedPipe = struct {
     };
 
     pub const Connection = struct {
-        handle: std.os.windows.HANDLE,
+        handle: windows.HANDLE,
 
         pub fn read(self: *Connection, buf: []u8) !usize {
-            var bytes_read: std.os.windows.DWORD = 0;
-            if (std.os.windows.kernel32.ReadFile(
-                self.handle,
-                buf.ptr,
-                @intCast(buf.len),
-                &bytes_read,
-                null,
-            ) == 0) {
-                return error.ReadFailed;
-            }
-            return bytes_read;
+            return windows.ReadFile(self.handle, buf, null);
         }
 
         pub fn write(self: *Connection, data: []const u8) !usize {
-            var bytes_written: std.os.windows.DWORD = 0;
-            if (std.os.windows.kernel32.WriteFile(
-                self.handle,
-                data.ptr,
-                @intCast(data.len),
-                &bytes_written,
-                null,
-            ) == 0) {
-                return error.WriteFailed;
-            }
-            return bytes_written;
+            return windows.WriteFile(self.handle, data, null);
         }
 
         pub fn close(self: *Connection) void {
-            _ = std.os.windows.kernel32.DisconnectNamedPipe(self.handle);
-            std.os.windows.kernel32.CloseHandle(self.handle);
+            _ = DisconnectNamedPipe(self.handle);
+            windows.CloseHandle(self.handle);
         }
     };
 
-    pub fn listen(path: []const u8, allocator: std.mem.Allocator) !Server {
-        // Convert to Windows named pipe path format
-        const pipe_path = try std.fmt.allocPrintZ(allocator, "\\\\.\\pipe\\{s}", .{path});
-        return Server{ .pipe_path = pipe_path, .allocator = allocator };
+    pub fn listen(path: []const u8) !Server {
+        // For Windows, we need an allocator - use page allocator as fallback
+        const allocator = std.heap.page_allocator;
+        // Convert to Windows named pipe path format (wide string)
+        var pipe_path_buf: [256]u8 = undefined;
+        const pipe_path = std.fmt.bufPrint(&pipe_path_buf, "\\\\.\\pipe\\{s}", .{path}) catch {
+            return error.PathTooLong;
+        };
+        // Convert UTF-8 to UTF-16
+        const pipe_path_w = std.unicode.utf8ToUtf16LeAlloc(allocator, pipe_path) catch {
+            return error.EncodingFailed;
+        };
+        return Server{ .pipe_path_w = pipe_path_w, .allocator = allocator };
     }
 
     pub fn connect(path: []const u8) !Connection {
         var pipe_path_buf: [256]u8 = undefined;
-        const pipe_path = std.fmt.bufPrintZ(&pipe_path_buf, "\\\\.\\pipe\\{s}", .{path}) catch {
+        const pipe_path = std.fmt.bufPrint(&pipe_path_buf, "\\\\.\\pipe\\{s}", .{path}) catch {
             return error.PathTooLong;
         };
 
-        const handle = std.os.windows.kernel32.CreateFileA(
-            pipe_path.ptr,
-            std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
-            0,
-            null,
-            std.os.windows.OPEN_EXISTING,
-            0,
-            null,
-        );
+        // Convert to UTF-16 for Windows API
+        var wide_buf: [512]u16 = undefined;
+        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, pipe_path) catch {
+            return error.EncodingFailed;
+        };
+        wide_buf[wide_len] = 0; // null terminate
 
-        if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+        // Use OpenFile for connecting to existing named pipe
+        const handle = windows.OpenFile(@ptrCast(wide_buf[0..wide_len :0]), .{
+            .access_mask = windows.GENERIC_READ | windows.GENERIC_WRITE,
+            .creation = windows.FILE_OPEN,
+        }) catch {
             return error.ConnectFailed;
-        }
+        };
 
         return Connection{ .handle = handle };
     }

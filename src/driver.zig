@@ -1,4 +1,26 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// ============================================================================
+// PLATFORM-SPECIFIC HELPERS
+// ============================================================================
+
+/// Cross-platform home directory lookup
+fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        // On Windows, use USERPROFILE environment variable
+        var env_map = try std.process.getEnvMap(allocator);
+        defer env_map.deinit();
+        if (env_map.get("USERPROFILE")) |profile| {
+            return try allocator.dupe(u8, profile);
+        }
+        return try allocator.dupe(u8, "C:\\Users\\Default");
+    } else {
+        // On Unix, use HOME environment variable
+        const home = std.posix.getenv("HOME") orelse "/tmp";
+        return try allocator.dupe(u8, home);
+    }
+}
 
 // ============================================================================
 // DRIVER INTERFACE
@@ -72,7 +94,7 @@ pub const DriverVTable = extern struct {
 
 /// Loaded driver instance
 pub const Driver = struct {
-    handle: *anyopaque, // dlopen handle
+    dynlib: std.DynLib, // cross-platform dynamic library handle
     vtable: *const DriverVTable,
     context: ?*anyopaque,
     name: []const u8,
@@ -110,9 +132,8 @@ pub const Driver = struct {
 
     pub fn deinit(self: *Driver) void {
         self.vtable.deinit(self.context);
-        // Close dlopen handle
-        const handle: *anyopaque = self.handle;
-        _ = std.c.dlclose(handle);
+        // Close dynamic library handle
+        self.dynlib.close();
     }
 };
 
@@ -125,7 +146,8 @@ pub const DriverManager = struct {
     drivers_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator) !DriverManager {
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        const home = try getHomeDir(allocator);
+        defer allocator.free(home);
         const drivers_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, DRIVERS_DIR });
 
         // Ensure drivers directory exists
@@ -204,15 +226,16 @@ pub const DriverManager = struct {
 
     /// Load a driver by name
     pub fn load(self: *DriverManager, name: []const u8) !Driver {
-        // Determine library extension based on OS
-        const lib_ext = switch (@import("builtin").os.tag) {
+        // Determine library extension and prefix based on OS
+        const lib_ext = switch (builtin.os.tag) {
             .macos => ".dylib",
             .linux => ".so",
             .windows => ".dll",
             else => return error.UnsupportedPlatform,
         };
+        const lib_prefix = if (builtin.os.tag == .windows) "" else "lib";
 
-        // Driver name like "granville-llama" -> lib name "libgranville_llama"
+        // Driver name like "granville-llama" -> lib name "libgranville_llama" (Unix) or "granville_llama" (Windows)
         // Replace hyphens with underscores for the library name
         var lib_name_buf: [256]u8 = undefined;
         var lib_name_len: usize = 0;
@@ -225,38 +248,32 @@ pub const DriverManager = struct {
 
         const lib_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}/lib{s}{s}",
-            .{ self.drivers_path, name, lib_name, lib_ext },
+            "{s}/{s}/{s}{s}{s}",
+            .{ self.drivers_path, name, lib_prefix, lib_name, lib_ext },
         );
         defer self.allocator.free(lib_path);
 
-        // Convert to null-terminated for dlopen
-        var path_buf: [4096]u8 = undefined;
-        @memcpy(path_buf[0..lib_path.len], lib_path);
-        path_buf[lib_path.len] = 0;
-
-        // Load the shared library
-        const handle = std.c.dlopen(path_buf[0..lib_path.len :0], .{ .LAZY = true }) orelse {
-            std.debug.print("Failed to load driver: {s}\n", .{std.c.dlerror() orelse "unknown error"});
+        // Load the shared library using std.DynLib (cross-platform)
+        var dynlib = std.DynLib.open(lib_path) catch |err| {
+            std.debug.print("Failed to load driver '{s}': {}\n", .{ lib_path, err });
             return error.DriverLoadFailed;
         };
+        errdefer dynlib.close();
 
         // Get the vtable symbol
-        const vtable_ptr = std.c.dlsym(handle, "granville_driver_vtable") orelse {
-            _ = std.c.dlclose(handle);
+        const vtable_ptr = dynlib.lookup(*const DriverVTable, "granville_driver_vtable") orelse {
+            std.debug.print("Driver missing granville_driver_vtable symbol\n", .{});
             return error.InvalidDriver;
         };
 
-        const vtable: *const DriverVTable = @ptrCast(@alignCast(vtable_ptr));
-
         // Initialize the driver
-        const context = vtable.init();
+        const context = vtable_ptr.init();
 
         return Driver{
-            .handle = handle,
-            .vtable = vtable,
+            .dynlib = dynlib,
+            .vtable = vtable_ptr,
             .context = context,
-            .name = std.mem.span(vtable.get_name()),
+            .name = std.mem.span(vtable_ptr.get_name()),
         };
     }
 

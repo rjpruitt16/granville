@@ -1,6 +1,24 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const MODELS_DIR = ".grainville/models";
+const MODELS_DIR = ".granville/models";
+
+/// Cross-platform home directory lookup
+fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        // On Windows, use USERPROFILE environment variable
+        var env_map = try std.process.getEnvMap(allocator);
+        defer env_map.deinit();
+        if (env_map.get("USERPROFILE")) |profile| {
+            return try allocator.dupe(u8, profile);
+        }
+        return try allocator.dupe(u8, "C:\\Users\\Default");
+    } else {
+        // On Unix, use HOME environment variable
+        const home = std.posix.getenv("HOME") orelse "/tmp";
+        return try allocator.dupe(u8, home);
+    }
+}
 
 pub fn downloadModel(allocator: std.mem.Allocator, url: []const u8) !void {
     std.debug.print("Downloading model from: {s}\n", .{url});
@@ -10,7 +28,8 @@ pub fn downloadModel(allocator: std.mem.Allocator, url: []const u8) !void {
     std.debug.print("Filename: {s}\n", .{filename});
 
     // Ensure models directory exists
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
     const models_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, MODELS_DIR });
     defer allocator.free(models_path);
 
@@ -18,10 +37,10 @@ pub fn downloadModel(allocator: std.mem.Allocator, url: []const u8) !void {
     std.fs.makeDirAbsolute(models_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            // Try creating parent .grainville first
-            const grainville_path = try std.fmt.allocPrint(allocator, "{s}/.grainville", .{home});
-            defer allocator.free(grainville_path);
-            std.fs.makeDirAbsolute(grainville_path) catch {};
+            // Try creating parent .granville first
+            const granville_path = try std.fmt.allocPrint(allocator, "{s}/.granville", .{home});
+            defer allocator.free(granville_path);
+            std.fs.makeDirAbsolute(granville_path) catch {};
             std.fs.makeDirAbsolute(models_path) catch {};
         },
     };
@@ -76,7 +95,8 @@ pub fn downloadModel(allocator: std.mem.Allocator, url: []const u8) !void {
 }
 
 pub fn getModelsDir(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
     return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, MODELS_DIR });
 }
 
@@ -131,6 +151,6 @@ test "models directory path construction" {
     const models_path = try getModelsDir(allocator);
     defer allocator.free(models_path);
 
-    // Should end with .grainville/models
-    try std.testing.expect(std.mem.endsWith(u8, models_path, ".grainville/models"));
+    // Should end with .granville/models
+    try std.testing.expect(std.mem.endsWith(u8, models_path, ".granville/models"));
 }
