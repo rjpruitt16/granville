@@ -378,7 +378,11 @@ pub const DriverManager = struct {
         );
         child.cwd = null;
 
-        _ = try child.spawnAndWait();
+        const result = try child.spawnAndWait();
+        if (result.Exited != 0) {
+            std.debug.print("tar extraction failed with exit code: {d}\n", .{result.Exited});
+            return error.ExtractionFailed;
+        }
     }
 
     /// Remove an installed driver
