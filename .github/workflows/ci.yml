@@ -71,6 +71,10 @@ jobs:
           ls -la ~/.granville/drivers/granville-llama/ || echo "Driver directory not found"
           echo "=== Driver json ==="
           cat ~/.granville/drivers/granville-llama/driver.json || echo "No driver.json"
+          echo "=== Shared library dependencies ==="
+          ldd ~/.granville/drivers/granville-llama/libgranville_llama.so || echo "ldd failed"
+          echo "=== File type ==="
+          file ~/.granville/drivers/granville-llama/libgranville_llama.so || echo "file command failed"
 
       - name: Download test model
         run: |
