@@ -256,6 +256,13 @@ pub const DriverManager = struct {
         // Load the shared library using std.DynLib (cross-platform)
         var dynlib = std.DynLib.open(lib_path) catch |err| {
             std.debug.print("Failed to load driver '{s}': {}\n", .{ lib_path, err });
+            // On Linux/macOS, print the actual dlopen error message for debugging
+            if (builtin.os.tag != .windows) {
+                const dlerror_msg = std.c.dlerror();
+                if (dlerror_msg) |msg| {
+                    std.debug.print("dlopen error: {s}\n", .{msg});
+                }
+            }
             return error.DriverLoadFailed;
         };
         errdefer dynlib.close();
