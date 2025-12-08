@@ -59,7 +59,7 @@ def test_version():
         text=True
     )
     output = result.stdout + result.stderr
-    assert "0.1.0" in output, f"Got: {output}"
+    assert "0.2.0" in output, f"Got: {output}"
     print("  PASS: version")
 
 def test_serve_without_model():
