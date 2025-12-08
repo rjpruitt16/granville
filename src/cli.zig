@@ -2,8 +2,9 @@ const std = @import("std");
 const download = @import("download.zig");
 const server = @import("server.zig");
 const driver = @import("driver.zig");
+const model_pool = @import("model_pool.zig");
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0"; // Multi-model support
 
 pub const Command = enum {
     download,
@@ -17,20 +18,35 @@ pub const Command = enum {
 
 pub const Config = struct {
     command: Command,
+    allocator: std.mem.Allocator,
     // Download options
     url: ?[]const u8 = null,
     // Serve options
-    model_path: ?[]const u8 = null,
+    model_specs: std.ArrayList(model_pool.ModelSpec),
     port: u16 = 8080,
     socket_path: []const u8 = "/tmp/granville.sock",
     queue_size: usize = 1000,
+    num_workers: ?usize = null, // null = auto (min of num_models, 8)
     driver_name: ?[]const u8 = null,
     // Driver options
     driver_backend: []const u8 = "granville-llama",
+
+    pub fn init(allocator: std.mem.Allocator) Config {
+        return .{
+            .command = .help,
+            .allocator = allocator,
+            .model_specs = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Config) void {
+        self.model_specs.deinit(self.allocator);
+    }
 };
 
 pub fn run(allocator: std.mem.Allocator) !void {
-    const config = try parseArgs(allocator);
+    var config = try parseArgs(allocator);
+    defer config.deinit();
 
     switch (config.command) {
         .download => {
@@ -43,10 +59,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
             }
         },
         .serve => {
-            if (config.model_path) |model_path| {
-                try server.start(allocator, model_path, config);
+            if (config.model_specs.items.len > 0) {
+                try server.start(allocator, config);
             } else {
-                std.debug.print("Error: Model path required for serve command\n", .{});
+                std.debug.print("Error: At least one model required for serve command\n", .{});
                 printUsage();
                 return error.MissingArgument;
             }
@@ -105,9 +121,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     defer args.deinit();
     _ = args.skip(); // Skip program name
 
-    var config = Config{
-        .command = .help,
-    };
+    var config = Config.init(allocator);
 
     // Parse command
     if (args.next()) |cmd| {
@@ -137,9 +151,13 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     if (args.next()) |driver_name| {
                         config.driver_backend = driver_name;
                     }
+                } else if (std.mem.eql(u8, arg, "--workers") or std.mem.eql(u8, arg, "-w")) {
+                    if (args.next()) |workers_str| {
+                        config.num_workers = std.fmt.parseInt(usize, workers_str, 10) catch null;
+                    }
                 } else if (!std.mem.startsWith(u8, arg, "-")) {
-                    // Assume it's the model path
-                    config.model_path = arg;
+                    // It's a model spec (path or type:id:path format)
+                    try config.model_specs.append(allocator, model_pool.ModelSpec.parse(arg));
                 }
             }
         } else if (std.mem.eql(u8, cmd, "driver")) {
@@ -187,7 +205,7 @@ fn printUsage() void {
         \\
         \\COMMANDS:
         \\    download <url>         Download a GGUF model from Hugging Face
-        \\    serve <model>          Start the inference server
+        \\    serve <models...>      Start the inference server with one or more models
         \\    driver <subcommand>    Manage inference drivers
         \\    help                   Show this help message
         \\    version                Show version information
@@ -196,11 +214,17 @@ fn printUsage() void {
         \\    <url>                  Hugging Face URL to GGUF model file
         \\
         \\SERVE OPTIONS:
-        \\    <model>                Path to model file or model name in ~/.granville/models/
+        \\    <models...>            One or more model specs (see MODEL SPEC FORMAT below)
         \\    -p, --port <port>      Port for HTTP status endpoint (default: 8080)
         \\    -s, --socket <path>    Unix socket path (default: /tmp/granville.sock)
         \\    -q, --queue-size <n>   Maximum queue size (default: 1000)
+        \\    -w, --workers <n>      Number of worker threads (default: min(num_models, 8))
         \\    -d, --driver <name>    Inference driver to use (default: granville-llama)
+        \\
+        \\MODEL SPEC FORMAT:
+        \\    path.gguf              Simple path (type=unassigned, id=auto)
+        \\    type:path.gguf         With type (inference, stt, tts, embedding)
+        \\    type:id:path.gguf      With type and explicit ID
         \\
         \\DRIVER SUBCOMMANDS:
         \\    driver install <name>  Install a driver from the registry
@@ -210,8 +234,9 @@ fn printUsage() void {
         \\EXAMPLES:
         \\    granville download https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_K_M.gguf
         \\    granville driver install granville-llama
-        \\    granville serve llama-2-7b.Q4_K_M.gguf --port 8080
-        \\    granville serve ~/.granville/models/phi-3.gguf -s /tmp/phi.sock
+        \\    granville serve model.gguf
+        \\    granville serve model1.gguf model2.gguf model3.gguf
+        \\    granville serve inference:main:llama.gguf stt:whisper:whisper.gguf
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -221,29 +246,30 @@ fn printVersion() void {
     std.debug.print("granville {s}\n", .{VERSION});
 }
 
-test "parse download command" {
-    const config = Config{
-        .command = .download,
-        .url = "https://example.com/model.gguf",
-    };
-    try std.testing.expectEqual(Command.download, config.command);
+test "config init and deinit" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+    try std.testing.expectEqual(Command.help, config.command);
+    try std.testing.expectEqual(@as(usize, 0), config.model_specs.items.len);
 }
 
-test "parse serve command" {
-    const config = Config{
-        .command = .serve,
-        .model_path = "/path/to/model.gguf",
-        .port = 9000,
-    };
-    try std.testing.expectEqual(Command.serve, config.command);
-    try std.testing.expectEqual(@as(u16, 9000), config.port);
-}
-
-test "default config values" {
-    const config = Config{
-        .command = .help,
-    };
+test "config default values" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
     try std.testing.expectEqual(@as(u16, 8080), config.port);
     try std.testing.expectEqual(@as(usize, 1000), config.queue_size);
     try std.testing.expectEqualStrings("/tmp/granville.sock", config.socket_path);
+}
+
+test "config with model specs" {
+    var config = Config.init(std.testing.allocator);
+    defer config.deinit();
+    config.command = .serve;
+
+    try config.model_specs.append(std.testing.allocator, model_pool.ModelSpec.parse("model1.gguf"));
+    try config.model_specs.append(std.testing.allocator, model_pool.ModelSpec.parse("inference:model2.gguf"));
+
+    try std.testing.expectEqual(@as(usize, 2), config.model_specs.items.len);
+    try std.testing.expectEqualStrings("model1.gguf", config.model_specs.items[0].path);
+    try std.testing.expectEqual(model_pool.ModelType.inference, config.model_specs.items[1].model_type);
 }

@@ -11,6 +11,8 @@ pub const TaskRequest = struct {
     ranked: bool = false,
     priority: ?[]const u8 = null,
     callback: []const u8, // Unix socket path to send result
+    model_id: ?u32 = null, // null = load balancer picks, or specific model for sticky sessions
+    max_tokens: ?u32 = null, // null = server default (256)
 };
 
 // ============================================================================
@@ -33,6 +35,7 @@ pub const ToolCall = struct {
 /// Final result sent to callback
 pub const TaskResult = struct {
     id: []const u8,
+    model_id: ?u32 = null, // which model handled this request (for sticky routing)
     tool_id: ?[]const u8 = null,
     tool_input_json: ?[]const u8 = null,
     priority: []const u8 = "normal",
@@ -99,9 +102,10 @@ pub fn errorResult(id: []const u8, err: []const u8, code: ErrorCode) TaskResult 
     };
 }
 
-pub fn successResult(id: []const u8, tool_id: []const u8, tool_input_json: []const u8, priority: []const u8, raw: ?[]const u8) TaskResult {
+pub fn successResult(id: []const u8, model_id: ?u32, tool_id: []const u8, tool_input_json: []const u8, priority: []const u8, raw: ?[]const u8) TaskResult {
     return TaskResult{
         .id = id,
+        .model_id = model_id,
         .tool_id = tool_id,
         .tool_input_json = tool_input_json,
         .priority = priority,

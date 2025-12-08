@@ -4,6 +4,7 @@ const cli = @import("cli.zig");
 const scheduler = @import("scheduler.zig");
 const protocol = @import("protocol.zig");
 const driver_mod = @import("driver.zig");
+const model_pool = @import("model_pool.zig");
 const builtin = @import("builtin");
 
 /// Platform-specific IPC abstraction
@@ -219,18 +220,31 @@ const RANK_PROMPT =
     \\Task:
 ;
 
-/// Server context holding loaded driver and model
+/// Result from inference containing both response and which model was used
+const InferenceResult = struct {
+    response: []const u8,
+    model_id: u32,
+};
+
+/// Server context holding loaded driver and model pool
 const ServerContext = struct {
     allocator: std.mem.Allocator,
     driver: ?driver_mod.Driver,
-    model: ?*anyopaque,
-    model_path: []const u8,
+    pool: ?model_pool.ModelPool,
 
-    fn generate(self: *ServerContext, prompt: []const u8, max_tokens: u32) ![]const u8 {
-        if (self.driver) |*drv| {
-            if (self.model) |model| {
-                return drv.generate(model, prompt, max_tokens);
-            }
+    /// Generate using any available model (least-busy routing)
+    /// If requested_model_id is provided, use that model; otherwise pick least-busy
+    fn generateWithRouting(self: *ServerContext, requested_model_id: ?u32, prompt: []const u8, max_tokens: u32) !InferenceResult {
+        if (self.pool) |*pool| {
+            // Use atomic acquire for least-busy routing to prevent race conditions
+            const model = if (requested_model_id) |id|
+                pool.getById(id) orelse return error.ModelNotFound
+            else
+                pool.acquireLeastBusy(null) orelse return error.NoModelsAvailable;
+
+            defer pool.markIdle(model);
+            const response = try pool.generate(model, prompt, max_tokens);
+            return .{ .response = response, .model_id = model.id };
         }
         return error.ModelNotLoaded;
     }
@@ -243,18 +257,18 @@ const ServerContext = struct {
             return .normal; // Default on error
         };
 
-        // Ask model to classify (short response)
-        const response = self.generate(prompt, 10) catch {
+        // Ask model to classify (short response) - uses least-busy routing
+        const result = self.generateWithRouting(null, prompt, 10) catch {
             std.debug.print("[ranking] Model error, defaulting to normal\n", .{});
             return .normal;
         };
-        defer self.freeString(response);
+        defer self.freeString(result.response);
 
         // Parse response - look for priority keywords
         const upper = blk: {
             var buf: [64]u8 = undefined;
-            const len = @min(response.len, buf.len);
-            for (response[0..len], 0..) |c, i| {
+            const len = @min(result.response.len, buf.len);
+            for (result.response[0..len], 0..) |c, i| {
                 buf[i] = std.ascii.toUpper(c);
             }
             break :blk buf[0..len];
@@ -272,23 +286,23 @@ const ServerContext = struct {
         std.debug.print("[ranking] '{s}' -> {s} (response: {s})\n", .{
             text[0..@min(text.len, 50)],
             priority.toString(),
-            response[0..@min(response.len, 30)],
+            result.response[0..@min(result.response.len, 30)],
         });
 
         return priority;
     }
 
     fn freeString(self: *ServerContext, str: []const u8) void {
-        if (self.driver) |*drv| {
-            drv.freeString(str);
+        if (self.pool) |*pool| {
+            pool.freeString(str);
         }
     }
 
     fn deinit(self: *ServerContext) void {
+        if (self.pool) |*pool| {
+            pool.deinit();
+        }
         if (self.driver) |*drv| {
-            if (self.model) |model| {
-                drv.unloadModel(model);
-            }
             drv.deinit();
         }
     }
@@ -299,6 +313,8 @@ const UnrankedTask = struct {
     id: []const u8,
     text: []const u8,
     callback: []const u8,
+    model_id: ?u32, // null = load balancer picks, or specific model for sticky sessions
+    max_tokens: u32, // default 256
 };
 
 /// Ranked task - ready for inference
@@ -307,6 +323,8 @@ const RankedTask = struct {
     text: []const u8,
     callback: []const u8,
     priority: scheduler.Priority,
+    model_id: ?u32, // null = load balancer picks, or specific model for sticky sessions
+    max_tokens: u32, // default 256
 };
 
 /// Thread-safe queue for unranked tasks (FIFO)
@@ -406,6 +424,7 @@ const ThreadContext = struct {
     unranked_queue: *UnrankedQueue,
     ranked_queue: *RankedQueue,
     running: std.atomic.Value(bool),
+    worker_id: u32, // identifies which worker this is
 };
 
 /// Ranker thread - pulls from unranked queue, classifies, pushes to ranked queue
@@ -428,6 +447,8 @@ fn rankerThread(ctx: *ThreadContext) void {
                 .text = task.text,
                 .callback = task.callback,
                 .priority = priority,
+                .model_id = task.model_id,
+                .max_tokens = task.max_tokens,
             };
 
             ctx.ranked_queue.push(ranked_task) catch |err| {
@@ -447,35 +468,37 @@ fn rankerThread(ctx: *ThreadContext) void {
 
 /// Worker thread - pulls highest priority from ranked queue, runs inference
 fn workerThread(ctx: *ThreadContext) void {
-    std.debug.print("[worker] Started inference thread\n", .{});
+    std.debug.print("[worker-{d}] Started inference thread\n", .{ctx.worker_id});
 
     while (ctx.running.load(.acquire)) {
         if (ctx.ranked_queue.popHighestPriority()) |task| {
-            std.debug.print("[worker] Processing task {s} (priority: {s})\n", .{
+            std.debug.print("[worker-{d}] Processing task {s} (priority: {s}, requested_model: {?})\n", .{
+                ctx.worker_id,
                 task.id,
                 task.priority.toString(),
+                task.model_id,
             });
 
-            // Run inference
-            const response = ctx.server_ctx.generate(task.text, 256) catch |err| {
-                std.debug.print("[worker] Inference failed: {}\n", .{err});
+            // Run inference with routing (uses requested model_id or least-busy)
+            const result = ctx.server_ctx.generateWithRouting(task.model_id, task.text, task.max_tokens) catch |err| {
+                std.debug.print("[worker-{d}] Inference failed: {}\n", .{ ctx.worker_id, err });
                 sendCallbackError(ctx.allocator, task.callback, task.id, "inference_failed", .internal_error) catch {};
                 continue;
             };
-            defer ctx.server_ctx.freeString(response);
+            defer ctx.server_ctx.freeString(result.response);
 
-            std.debug.print("[worker] Generated {d} chars for {s}\n", .{ response.len, task.id });
+            std.debug.print("[worker-{d}] Generated {d} chars for {s} (model: {d})\n", .{ ctx.worker_id, result.response.len, task.id, result.model_id });
 
             // Format response as JSON array
             var json_buf: [32768]u8 = undefined;
-            const json_response = std.fmt.bufPrint(&json_buf, "[\"{s}\"]", .{response}) catch {
+            const json_response = std.fmt.bufPrint(&json_buf, "[\"{s}\"]", .{result.response}) catch {
                 sendCallbackError(ctx.allocator, task.callback, task.id, "response_too_long", .internal_error) catch {};
                 continue;
             };
 
-            // Send result to callback
-            sendCallbackResult(ctx.allocator, task.callback, task.id, "__chat__", json_response, task.priority.toString()) catch |err| {
-                std.debug.print("[worker] Failed to send callback: {}\n", .{err});
+            // Send result to callback (includes model_id for sticky routing)
+            sendCallbackResult(ctx.allocator, task.callback, task.id, result.model_id, "__chat__", json_response, task.priority.toString()) catch |err| {
+                std.debug.print("[worker-{d}] Failed to send callback: {}\n", .{ ctx.worker_id, err });
             };
         } else {
             // No tasks, sleep briefly
@@ -483,12 +506,12 @@ fn workerThread(ctx: *ThreadContext) void {
         }
     }
 
-    std.debug.print("[worker] Stopped\n", .{});
+    std.debug.print("[worker-{d}] Stopped\n", .{ctx.worker_id});
 }
 
-pub fn start(allocator: std.mem.Allocator, model_path: []const u8, config: cli.Config) !void {
+pub fn start(allocator: std.mem.Allocator, config: cli.Config) !void {
     std.debug.print("Starting Granville server...\n", .{});
-    std.debug.print("Model: {s}\n", .{model_path});
+    std.debug.print("Models: {d} to load\n", .{config.model_specs.items.len});
     std.debug.print("Driver: {s}\n", .{config.driver_backend});
     std.debug.print("Socket: {s}\n", .{config.socket_path});
     std.debug.print("Queue size: {d}\n", .{config.queue_size});
@@ -508,21 +531,25 @@ pub fn start(allocator: std.mem.Allocator, model_path: []const u8, config: cli.C
 
     std.debug.print("Driver loaded: {s}\n", .{drv.name});
 
-    // Load the model
-    std.debug.print("\nLoading model '{s}'...\n", .{model_path});
-    const model = drv.loadModel(model_path) catch |err| {
-        std.debug.print("Failed to load model: {}\n", .{err});
-        drv.deinit();
-        return err;
-    };
-    std.debug.print("Model loaded successfully!\n", .{});
+    // Create model pool and load all models
+    var pool = model_pool.ModelPool.init(allocator, &drv);
+
+    std.debug.print("\nLoading {d} model(s)...\n", .{config.model_specs.items.len});
+    for (config.model_specs.items) |spec| {
+        _ = pool.loadModel(spec) catch |err| {
+            std.debug.print("Failed to load model '{s}': {}\n", .{ spec.path, err });
+            pool.deinit();
+            drv.deinit();
+            return err;
+        };
+    }
+    std.debug.print("All models loaded successfully! ({d} total)\n", .{pool.count()});
 
     // Create server context
     var ctx = ServerContext{
         .allocator = allocator,
         .driver = drv,
-        .model = model,
-        .model_path = model_path,
+        .pool = pool,
     };
     defer ctx.deinit();
 
@@ -533,25 +560,59 @@ pub fn start(allocator: std.mem.Allocator, model_path: []const u8, config: cli.C
     var ranked_queue = RankedQueue.init(allocator);
     defer ranked_queue.deinit();
 
-    // Create thread context
-    var thread_ctx = ThreadContext{
+    // Determine number of worker threads
+    // Default: min(num_models, 8) for bounded parallelism
+    const max_default_workers: usize = 8;
+    const num_workers = config.num_workers orelse @min(pool.count(), max_default_workers);
+    std.debug.print("Starting {d} worker thread(s) for {d} model(s)\n", .{ num_workers, pool.count() });
+
+    // Create thread contexts - one per worker
+    const worker_contexts = try allocator.alloc(ThreadContext, num_workers);
+    defer allocator.free(worker_contexts);
+
+    // Initialize shared running flag
+    var running = std.atomic.Value(bool).init(true);
+
+    for (worker_contexts, 0..) |*wctx, i| {
+        wctx.* = ThreadContext{
+            .allocator = allocator,
+            .server_ctx = &ctx,
+            .unranked_queue = &unranked_queue,
+            .ranked_queue = &ranked_queue,
+            .running = running,
+            .worker_id = @intCast(i + 1),
+        };
+    }
+
+    // Create ranker context (shares running flag)
+    var ranker_ctx = ThreadContext{
         .allocator = allocator,
         .server_ctx = &ctx,
         .unranked_queue = &unranked_queue,
         .ranked_queue = &ranked_queue,
-        .running = std.atomic.Value(bool).init(true),
+        .running = running,
+        .worker_id = 0, // ranker doesn't use this
     };
 
     // Start ranker thread (classifies tasks)
-    const ranker = try std.Thread.spawn(.{}, rankerThread, .{&thread_ctx});
+    const ranker = try std.Thread.spawn(.{}, rankerThread, .{&ranker_ctx});
     defer {
-        thread_ctx.running.store(false, .release);
+        running.store(false, .release);
         ranker.join();
     }
 
-    // Start worker thread (runs inference)
-    const worker = try std.Thread.spawn(.{}, workerThread, .{&thread_ctx});
-    defer worker.join();
+    // Start worker threads (bounded pool for parallel inference)
+    var workers = try allocator.alloc(std.Thread, num_workers);
+    defer allocator.free(workers);
+
+    for (worker_contexts, 0..) |*wctx, i| {
+        workers[i] = try std.Thread.spawn(.{}, workerThread, .{wctx});
+    }
+    defer {
+        for (workers) |worker| {
+            worker.join();
+        }
+    }
 
     // Create platform-specific server
     var server = try ipc.listen(config.socket_path);
@@ -568,18 +629,21 @@ pub fn start(allocator: std.mem.Allocator, model_path: []const u8, config: cli.C
             continue;
         };
 
-        // Handle connection (receives task, ACKs, enqueues to unranked queue)
-        handleConnection(allocator, &connection, &unranked_queue) catch |err| {
+        // Handle connection (receives task, ACKs, enqueues)
+        handleConnection(allocator, &connection, &unranked_queue, &ranked_queue) catch |err| {
             std.debug.print("Connection error: {}\n", .{err});
         };
     }
 }
 
-/// Handle incoming connection - just ACK and enqueue (fast path)
+/// Handle incoming connection - ACK and enqueue (fast path)
+/// If ranked=true, goes to unranked_queue for classification
+/// If ranked=false, goes directly to ranked_queue with normal priority
 fn handleConnection(
     allocator: std.mem.Allocator,
     connection: *ipc.Connection,
     unranked_queue: *UnrankedQueue,
+    ranked_queue: *RankedQueue,
 ) !void {
     defer connection.close();
 
@@ -609,38 +673,92 @@ fn handleConnection(
         try sendErrorResponseConn(allocator, connection, "unknown", "missing_id", .invalid_request);
         return;
     };
-    const id_str = id.str.value();
+    // Duplicate strings so they outlive the request_payload (which gets freed below)
+    const id_str = try allocator.dupe(u8, id.str.value());
+    errdefer allocator.free(id_str);
 
     const text = (try request_payload.mapGet("text")) orelse {
         try sendErrorResponseConn(allocator, connection, id_str, "missing_text", .invalid_request);
         return;
     };
-    const text_str = text.str.value();
+    const text_str = try allocator.dupe(u8, text.str.value());
+    errdefer allocator.free(text_str);
 
     const callback = (try request_payload.mapGet("callback")) orelse {
         try sendErrorResponseConn(allocator, connection, id_str, "missing_callback", .invalid_request);
         return;
     };
-    const callback_str = callback.str.value();
+    const callback_str = try allocator.dupe(u8, callback.str.value());
+    errdefer allocator.free(callback_str);
 
-    std.debug.print("Request: id={s}, text='{s}', callback={s}\n", .{
+    // Parse optional model_id (for sticky routing)
+    const model_id: ?u32 = blk: {
+        const model_id_val = try request_payload.mapGet("model_id");
+        if (model_id_val) |val| {
+            if (val == .uint) {
+                break :blk @intCast(val.uint);
+            }
+        }
+        break :blk null;
+    };
+
+    // Parse optional ranked flag (default: true for backward compatibility)
+    const needs_ranking: bool = blk: {
+        const ranked_val = try request_payload.mapGet("ranked");
+        if (ranked_val) |val| {
+            if (val == .bool) {
+                break :blk val.bool;
+            }
+        }
+        break :blk true; // default to ranking
+    };
+
+    // Parse optional max_tokens (default: 256)
+    const max_tokens: u32 = blk: {
+        const max_tokens_val = try request_payload.mapGet("max_tokens");
+        if (max_tokens_val) |val| {
+            if (val == .uint) {
+                break :blk @intCast(val.uint);
+            }
+        }
+        break :blk 256; // default
+    };
+
+    std.debug.print("Request: id={s}, text='{s}', callback={s}, model_id={?}, ranked={}\n", .{
         id_str,
         text_str[0..@min(text_str.len, 40)],
         callback_str,
+        model_id,
+        needs_ranking,
     });
 
     // Send immediate ACK response
     try sendAckResponseConn(allocator, connection, id_str);
 
-    // Enqueue to unranked queue (will be ranked by ranker thread)
-    const task = UnrankedTask{
-        .id = id_str,
-        .text = text_str,
-        .callback = callback_str,
-    };
-
-    try unranked_queue.push(task);
-    std.debug.print("Task {s} queued for ranking\n", .{id_str});
+    if (needs_ranking) {
+        // Enqueue to unranked queue (will be ranked by ranker thread)
+        const task = UnrankedTask{
+            .id = id_str,
+            .text = text_str,
+            .callback = callback_str,
+            .model_id = model_id,
+            .max_tokens = max_tokens,
+        };
+        try unranked_queue.push(task);
+        std.debug.print("Task {s} queued for ranking (max_tokens={d})\n", .{ id_str, max_tokens });
+    } else {
+        // Skip ranking - go directly to ranked queue with normal priority
+        const task = RankedTask{
+            .id = id_str,
+            .text = text_str,
+            .callback = callback_str,
+            .priority = .normal,
+            .model_id = model_id,
+            .max_tokens = max_tokens,
+        };
+        try ranked_queue.push(task);
+        std.debug.print("Task {s} queued directly (skip ranking, max_tokens={d})\n", .{ id_str, max_tokens });
+    }
 }
 
 /// Send ACK response via IPC connection
@@ -730,6 +848,7 @@ fn sendCallbackResult(
     allocator: std.mem.Allocator,
     callback_path: []const u8,
     id: []const u8,
+    model_id: u32,
     tool_id: []const u8,
     tool_input_json: []const u8,
     priority: []const u8,
@@ -751,6 +870,7 @@ fn sendCallbackResult(
     defer response.free(allocator);
 
     try response.mapPut("id", try msgpack.Payload.strToPayload(id, allocator));
+    try response.mapPut("model_id", msgpack.Payload{ .uint = model_id });
     try response.mapPut("tool_id", try msgpack.Payload.strToPayload(tool_id, allocator));
     try response.mapPut("tool_input_json", try msgpack.Payload.strToPayload(tool_input_json, allocator));
     try response.mapPut("priority", try msgpack.Payload.strToPayload(priority, allocator));
@@ -760,7 +880,7 @@ fn sendCallbackResult(
     const written = writer.end;
     _ = try conn.write(write_buf[0..written]);
 
-    std.debug.print("Sent result to callback {s}\n", .{callback_path});
+    std.debug.print("Sent result to callback {s} (model_id: {d})\n", .{ callback_path, model_id });
 }
 
 // ============================================================================
@@ -768,23 +888,21 @@ fn sendCallbackResult(
 // ============================================================================
 
 test "server config defaults" {
-    const config = cli.Config{
-        .command = .serve,
-        .model_path = "/path/to/model.gguf",
-    };
+    var config = cli.Config.init(std.testing.allocator);
+    defer config.deinit();
+    config.command = .serve;
     try std.testing.expectEqualStrings("/tmp/granville.sock", config.socket_path);
     try std.testing.expectEqual(@as(usize, 1000), config.queue_size);
     try std.testing.expectEqual(@as(u16, 8080), config.port);
 }
 
 test "server config custom values" {
-    const config = cli.Config{
-        .command = .serve,
-        .model_path = "/path/to/model.gguf",
-        .socket_path = "/tmp/custom.sock",
-        .queue_size = 500,
-        .port = 9000,
-    };
+    var config = cli.Config.init(std.testing.allocator);
+    defer config.deinit();
+    config.command = .serve;
+    config.socket_path = "/tmp/custom.sock";
+    config.queue_size = 500;
+    config.port = 9000;
     try std.testing.expectEqualStrings("/tmp/custom.sock", config.socket_path);
     try std.testing.expectEqual(@as(usize, 500), config.queue_size);
     try std.testing.expectEqual(@as(u16, 9000), config.port);
