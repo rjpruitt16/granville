@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            zig_target: x86_64-linux-gnu
+          - target: linux-aarch64
+            os: ubuntu-latest
+            zig_target: aarch64-linux-gnu
+          - target: macos-x86_64
+            os: macos-latest
+            zig_target: x86_64-macos
+          - target: macos-aarch64
+            os: macos-latest
+            zig_target: aarch64-macos
+          - target: windows-x86_64
+            os: ubuntu-latest
+            zig_target: x86_64-windows-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build Release Binary
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast
+
+      - name: Rename binary (Unix)
+        if: matrix.target != 'windows-x86_64'
+        run: |
+          mv zig-out/bin/granville granville-${{ matrix.target }}
+
+      - name: Rename binary (Windows)
+        if: matrix.target == 'windows-x86_64'
+        run: |
+          mv zig-out/bin/granville.exe granville-${{ matrix.target }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: granville-${{ matrix.target }}
+          path: granville-${{ matrix.target }}*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display artifacts
+        run: ls -R artifacts/
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/granville-linux-x86_64/granville-linux-x86_64 release/
+          cp artifacts/granville-linux-aarch64/granville-linux-aarch64 release/
+          cp artifacts/granville-macos-x86_64/granville-macos-x86_64 release/
+          cp artifacts/granville-macos-aarch64/granville-macos-aarch64 release/
+          cp artifacts/granville-windows-x86_64/granville-windows-x86_64.exe release/
+          chmod +x release/granville-*
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

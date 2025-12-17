@@ -110,7 +110,44 @@ When a request is submitted with `ranked: true`, the ranker thread:
 - **No data leakage** - PII can't appear in model responses or logs
 - **Zero latency overhead** - Redaction happens during ranking (already async)
 
-## Installation
+## Quick Start
+
+The easiest way to get started with the L8 OS stack (Granville + McCoy):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rjpruitt16/granville/main/install.sh | bash
+```
+
+This will:
+1. Download the Granville binary for your platform
+2. Install the `granville-llama` driver
+3. Download TinyLlama (~640MB) as a starter model
+4. Install McCoy (Python agent framework) via pip
+
+Then start chatting:
+
+```bash
+# Terminal 1: Start the inference server
+granville serve ~/.granville/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# Terminal 2: Chat with your local AI
+mccoy chat
+```
+
+### Install Options
+
+```bash
+# Skip model download (you have your own)
+curl -sSL ... | bash -s -- --no-model
+
+# Skip McCoy install (Granville only)
+curl -sSL ... | bash -s -- --no-mccoy
+
+# Install to a different directory
+INSTALL_DIR=/opt/bin curl -sSL ... | bash
+```
+
+### Manual Installation
 
 ```bash
 # Requires Zig 0.15.2+
