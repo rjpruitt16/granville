@@ -207,8 +207,9 @@ pub const ModelPool = struct {
     }
 
     /// Generate text using a specific model
-    pub fn generate(self: *ModelPool, model: *Model, prompt: []const u8, max_tokens: u32) ![]const u8 {
-        return self.driver.generate(model.handle, prompt, max_tokens);
+    /// @param reset_cache: if true, clear KV cache before inference (for independent requests)
+    pub fn generate(self: *ModelPool, model: *Model, prompt: []const u8, max_tokens: u32, reset_cache: bool) ![]const u8 {
+        return self.driver.generate(model.handle, prompt, max_tokens, reset_cache);
     }
 
     /// Free a string returned by generate

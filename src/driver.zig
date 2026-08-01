@@ -80,7 +80,8 @@ pub const DriverVTable = extern struct {
 
     /// Generate text from prompt
     /// Returns pointer to null-terminated string (caller must free with free_string)
-    generate: *const fn (?*anyopaque, ?*anyopaque, [*:0]const u8, u32) callconv(.c) [*:0]const u8,
+    /// @param reset_cache: if true, clear KV cache before inference (for independent requests)
+    generate: *const fn (?*anyopaque, ?*anyopaque, [*:0]const u8, u32, bool) callconv(.c) [*:0]const u8,
 
     /// Free a string returned by generate
     free_string: *const fn ([*:0]const u8) callconv(.c) void,
@@ -115,13 +116,13 @@ pub const Driver = struct {
         self.vtable.unload_model(self.context, model);
     }
 
-    pub fn generate(self: *Driver, model: *anyopaque, prompt: []const u8, max_tokens: u32) ![]const u8 {
+    pub fn generate(self: *Driver, model: *anyopaque, prompt: []const u8, max_tokens: u32, reset_cache: bool) ![]const u8 {
         var prompt_buf: [32768]u8 = undefined;
         if (prompt.len >= prompt_buf.len) return error.PromptTooLong;
         @memcpy(prompt_buf[0..prompt.len], prompt);
         prompt_buf[prompt.len] = 0;
 
-        const result = self.vtable.generate(self.context, model, prompt_buf[0..prompt.len :0], max_tokens);
+        const result = self.vtable.generate(self.context, model, prompt_buf[0..prompt.len :0], max_tokens, reset_cache);
         // Return as slice (caller should copy if needed, then call freeString)
         return std.mem.span(result);
     }

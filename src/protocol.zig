@@ -13,6 +13,7 @@ pub const TaskRequest = struct {
     callback: []const u8, // Unix socket path to send result
     model_id: ?u32 = null, // null = load balancer picks, or specific model for sticky sessions
     max_tokens: ?u32 = null, // null = server default (256)
+    reset_cache: bool = true, // Reset KV cache before inference (default: true for independent requests)
 };
 
 // ============================================================================

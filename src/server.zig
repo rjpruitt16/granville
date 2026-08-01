@@ -226,6 +226,81 @@ const InferenceResult = struct {
     model_id: u32,
 };
 
+/// Result of ranking: priority plus the redacted text that should actually
+/// reach inference. `text` is caller-owned (allocator.dupe'd).
+const RankResult = struct {
+    priority: scheduler.Priority,
+    text: []const u8,
+};
+
+fn parsePriority(response: []const u8) scheduler.Priority {
+    var buf: [64]u8 = undefined;
+    const len = @min(response.len, buf.len);
+    for (response[0..len], 0..) |c, i| {
+        buf[i] = std.ascii.toUpper(c);
+    }
+    const upper = buf[0..len];
+
+    if (std.mem.indexOf(u8, upper, "CRITICAL") != null) return .critical;
+    if (std.mem.indexOf(u8, upper, "HIGH") != null) return .high;
+    if (std.mem.indexOf(u8, upper, "LOW") != null) return .low;
+    return .normal;
+}
+
+/// Extract the text following a "REDACTED:" marker, trimmed and copied with
+/// `allocator`. Returns null if the marker isn't present so the caller can
+/// fall back to the original (unredacted) text rather than send nothing.
+fn parseRedacted(allocator: std.mem.Allocator, response: []const u8) ?[]const u8 {
+    const marker = "REDACTED:";
+    const idx = std.mem.indexOf(u8, response, marker) orelse return null;
+    const after = response[idx + marker.len ..];
+    const trimmed = std.mem.trim(u8, after, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
+/// Escape a string for JSON (handles quotes, backslashes, newlines, tabs, etc.)
+/// Returns the escaped string allocated from the provided buffer, or error if buffer too small
+fn jsonEscapeString(input: []const u8, buf: []u8) ![]const u8 {
+    var pos: usize = 0;
+
+    for (input) |c| {
+        const escaped: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x08 => "\\b", // backspace
+            0x0C => "\\f", // form feed
+            else => null,
+        };
+
+        if (escaped) |esc| {
+            if (pos + esc.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[pos..][0..esc.len], esc);
+            pos += esc.len;
+        } else if (c < 0x20) {
+            // Other control characters: escape as \u00XX
+            if (pos + 6 > buf.len) return error.NoSpaceLeft;
+            const hex_chars = "0123456789abcdef";
+            buf[pos] = '\\';
+            buf[pos + 1] = 'u';
+            buf[pos + 2] = '0';
+            buf[pos + 3] = '0';
+            buf[pos + 4] = hex_chars[(c >> 4) & 0xF];
+            buf[pos + 5] = hex_chars[c & 0xF];
+            pos += 6;
+        } else {
+            if (pos + 1 > buf.len) return error.NoSpaceLeft;
+            buf[pos] = c;
+            pos += 1;
+        }
+    }
+
+    return buf[0..pos];
+}
+
 /// Server context holding loaded driver and model pool
 const ServerContext = struct {
     allocator: std.mem.Allocator,
@@ -234,7 +309,7 @@ const ServerContext = struct {
 
     /// Generate using any available model (least-busy routing)
     /// If requested_model_id is provided, use that model; otherwise pick least-busy
-    fn generateWithRouting(self: *ServerContext, requested_model_id: ?u32, prompt: []const u8, max_tokens: u32) !InferenceResult {
+    fn generateWithRouting(self: *ServerContext, requested_model_id: ?u32, prompt: []const u8, max_tokens: u32, reset_cache: bool) !InferenceResult {
         if (self.pool) |*pool| {
             // Use atomic acquire for least-busy routing to prevent race conditions
             const model = if (requested_model_id) |id|
@@ -243,53 +318,50 @@ const ServerContext = struct {
                 pool.acquireLeastBusy(null) orelse return error.NoModelsAvailable;
 
             defer pool.markIdle(model);
-            const response = try pool.generate(model, prompt, max_tokens);
+            const response = try pool.generate(model, prompt, max_tokens, reset_cache);
             return .{ .response = response, .model_id = model.id };
         }
         return error.ModelNotLoaded;
     }
 
-    /// Rank a task by asking the model to classify its priority
-    fn rankTask(self: *ServerContext, text: []const u8) scheduler.Priority {
+    /// Rank a task: classify its priority AND redact PII, returning the
+    /// redacted text that should actually be used for inference. Falls back
+    /// to the original text (never blocks the request) if the model errors
+    /// or doesn't produce a parseable REDACTED section.
+    fn rankTask(self: *ServerContext, allocator: std.mem.Allocator, text: []const u8) RankResult {
         // Build classification prompt
         var prompt_buf: [4096]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s}{s}", .{ RANK_PROMPT, text }) catch {
-            return .normal; // Default on error
+            return .{ .priority = .normal, .text = allocator.dupe(u8, text) catch text };
         };
 
-        // Ask model to classify (short response) - uses least-busy routing
-        const result = self.generateWithRouting(null, prompt, 10) catch {
-            std.debug.print("[ranking] Model error, defaulting to normal\n", .{});
-            return .normal;
+        // The redacted text is roughly as long as the input (placeholders are
+        // shorter than what they replace), so the token budget has to scale
+        // with input length instead of the fixed 10 tokens this used to pass
+        // - which only ever had room for the priority line, never the
+        // redacted text, so nothing downstream ever saw it.
+        const estimated_tokens: usize = text.len / 3 + 32;
+        const rank_max_tokens: u32 = @intCast(@min(@max(estimated_tokens, 64), 2048));
+
+        // Uses least-busy routing, always reset cache for ranking.
+        const result = self.generateWithRouting(null, prompt, rank_max_tokens, true) catch {
+            std.debug.print("[ranking] Model error, defaulting to normal priority, no redaction\n", .{});
+            return .{ .priority = .normal, .text = allocator.dupe(u8, text) catch text };
         };
         defer self.freeString(result.response);
 
-        // Parse response - look for priority keywords
-        const upper = blk: {
-            var buf: [64]u8 = undefined;
-            const len = @min(result.response.len, buf.len);
-            for (result.response[0..len], 0..) |c, i| {
-                buf[i] = std.ascii.toUpper(c);
-            }
-            break :blk buf[0..len];
+        const priority = parsePriority(result.response);
+        const redacted = parseRedacted(allocator, result.response) orelse blk: {
+            std.debug.print("[ranking] No parseable REDACTED section, falling back to original text\n", .{});
+            break :blk allocator.dupe(u8, text) catch text;
         };
 
-        const priority = if (std.mem.indexOf(u8, upper, "CRITICAL") != null)
-            scheduler.Priority.critical
-        else if (std.mem.indexOf(u8, upper, "HIGH") != null)
-            scheduler.Priority.high
-        else if (std.mem.indexOf(u8, upper, "LOW") != null)
-            scheduler.Priority.low
-        else
-            scheduler.Priority.normal;
-
-        std.debug.print("[ranking] '{s}' -> {s} (response: {s})\n", .{
+        std.debug.print("[ranking] '{s}' -> {s}\n", .{
             text[0..@min(text.len, 50)],
             priority.toString(),
-            result.response[0..@min(result.response.len, 30)],
         });
 
-        return priority;
+        return .{ .priority = priority, .text = redacted };
     }
 
     fn freeString(self: *ServerContext, str: []const u8) void {
@@ -315,6 +387,7 @@ const UnrankedTask = struct {
     callback: []const u8,
     model_id: ?u32, // null = load balancer picks, or specific model for sticky sessions
     max_tokens: u32, // default 256
+    reset_cache: bool, // clear KV cache before inference (default: true for independent requests)
 };
 
 /// Ranked task - ready for inference
@@ -325,6 +398,7 @@ const RankedTask = struct {
     priority: scheduler.Priority,
     model_id: ?u32, // null = load balancer picks, or specific model for sticky sessions
     max_tokens: u32, // default 256
+    reset_cache: bool, // clear KV cache before inference (default: true for independent requests)
 };
 
 /// Thread-safe queue for unranked tasks (FIFO)
@@ -425,6 +499,7 @@ const ThreadContext = struct {
     ranked_queue: *RankedQueue,
     running: std.atomic.Value(bool),
     worker_id: u32, // identifies which worker this is
+    verbose: bool, // log full prompts and responses
 };
 
 /// Ranker thread - pulls from unranked queue, classifies, pushes to ranked queue
@@ -438,17 +513,19 @@ fn rankerThread(ctx: *ThreadContext) void {
                 task.text[0..@min(task.text.len, 40)],
             });
 
-            // Rank the task using the model
-            const priority = ctx.server_ctx.rankTask(task.text);
+            // Rank the task using the model - this also redacts PII, and the
+            // redacted text (not task.text) is what inference actually sees.
+            const rank_result = ctx.server_ctx.rankTask(ctx.allocator, task.text);
 
             // Push to ranked queue
             const ranked_task = RankedTask{
                 .id = task.id,
-                .text = task.text,
+                .text = rank_result.text,
                 .callback = task.callback,
-                .priority = priority,
+                .priority = rank_result.priority,
                 .model_id = task.model_id,
                 .max_tokens = task.max_tokens,
+                .reset_cache = task.reset_cache,
             };
 
             ctx.ranked_queue.push(ranked_task) catch |err| {
@@ -456,7 +533,7 @@ fn rankerThread(ctx: *ThreadContext) void {
                 sendCallbackError(ctx.allocator, task.callback, task.id, "queue_error", .internal_error) catch {};
             };
 
-            std.debug.print("[ranker] Task {s} ranked as {s}\n", .{ task.id, priority.toString() });
+            std.debug.print("[ranker] Task {s} ranked as {s}\n", .{ task.id, rank_result.priority.toString() });
         } else {
             // No tasks, sleep briefly
             std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -479,8 +556,13 @@ fn workerThread(ctx: *ThreadContext) void {
                 task.model_id,
             });
 
-            // Run inference with routing (uses requested model_id or least-busy)
-            const result = ctx.server_ctx.generateWithRouting(task.model_id, task.text, task.max_tokens) catch |err| {
+            // Verbose: log full prompt
+            if (ctx.verbose) {
+                std.debug.print("\n[PROMPT] task={s}\n{s}\n[/PROMPT]\n\n", .{ task.id, task.text });
+            }
+
+            // Run inference with routing (uses requested model_id or least-busy, respects reset_cache flag)
+            const result = ctx.server_ctx.generateWithRouting(task.model_id, task.text, task.max_tokens, task.reset_cache) catch |err| {
                 std.debug.print("[worker-{d}] Inference failed: {}\n", .{ ctx.worker_id, err });
                 sendCallbackError(ctx.allocator, task.callback, task.id, "inference_failed", .internal_error) catch {};
                 continue;
@@ -489,9 +571,20 @@ fn workerThread(ctx: *ThreadContext) void {
 
             std.debug.print("[worker-{d}] Generated {d} chars for {s} (model: {d})\n", .{ ctx.worker_id, result.response.len, task.id, result.model_id });
 
-            // Format response as JSON array
-            var json_buf: [32768]u8 = undefined;
-            const json_response = std.fmt.bufPrint(&json_buf, "[\"{s}\"]", .{result.response}) catch {
+            // Verbose: log full response
+            if (ctx.verbose) {
+                std.debug.print("\n[RESPONSE] task={s}\n{s}\n[/RESPONSE]\n\n", .{ task.id, result.response });
+            }
+
+            // Format response as JSON array (with proper escaping)
+            var escape_buf: [65536]u8 = undefined; // 2x json_buf for worst-case escaping
+            const escaped = jsonEscapeString(result.response, &escape_buf) catch {
+                sendCallbackError(ctx.allocator, task.callback, task.id, "response_too_long", .internal_error) catch {};
+                continue;
+            };
+
+            var json_buf: [65536]u8 = undefined;
+            const json_response = std.fmt.bufPrint(&json_buf, "[\"{s}\"]", .{escaped}) catch {
                 sendCallbackError(ctx.allocator, task.callback, task.id, "response_too_long", .internal_error) catch {};
                 continue;
             };
@@ -516,6 +609,9 @@ pub fn start(allocator: std.mem.Allocator, config: cli.Config) !void {
     std.debug.print("Socket: {s}\n", .{config.socket_path});
     std.debug.print("Queue size: {d}\n", .{config.queue_size});
     std.debug.print("Platform: {s}\n", .{@tagName(builtin.os.tag)});
+    if (config.verbose) {
+        std.debug.print("Verbose: enabled (logging full prompts and responses)\n", .{});
+    }
 
     // Initialize driver manager and load driver
     var manager = try driver_mod.DriverManager.init(allocator);
@@ -581,6 +677,7 @@ pub fn start(allocator: std.mem.Allocator, config: cli.Config) !void {
             .ranked_queue = &ranked_queue,
             .running = running,
             .worker_id = @intCast(i + 1),
+            .verbose = config.verbose,
         };
     }
 
@@ -592,6 +689,7 @@ pub fn start(allocator: std.mem.Allocator, config: cli.Config) !void {
         .ranked_queue = &ranked_queue,
         .running = running,
         .worker_id = 0, // ranker doesn't use this
+        .verbose = config.verbose,
     };
 
     // Start ranker thread (classifies tasks)
@@ -724,6 +822,17 @@ fn handleConnection(
         break :blk 256; // default
     };
 
+    // Parse optional reset_cache (default: true for independent requests)
+    const reset_cache: bool = blk: {
+        const reset_cache_val = try request_payload.mapGet("reset_cache");
+        if (reset_cache_val) |val| {
+            if (val == .bool) {
+                break :blk val.bool;
+            }
+        }
+        break :blk true; // default: reset cache for independent requests
+    };
+
     std.debug.print("Request: id={s}, text='{s}', callback={s}, model_id={?}, ranked={}\n", .{
         id_str,
         text_str[0..@min(text_str.len, 40)],
@@ -743,9 +852,10 @@ fn handleConnection(
             .callback = callback_str,
             .model_id = model_id,
             .max_tokens = max_tokens,
+            .reset_cache = reset_cache,
         };
         try unranked_queue.push(task);
-        std.debug.print("Task {s} queued for ranking (max_tokens={d})\n", .{ id_str, max_tokens });
+        std.debug.print("Task {s} queued for ranking (max_tokens={d}, reset_cache={})\n", .{ id_str, max_tokens, reset_cache });
     } else {
         // Skip ranking - go directly to ranked queue with normal priority
         const task = RankedTask{
@@ -755,9 +865,10 @@ fn handleConnection(
             .priority = .normal,
             .model_id = model_id,
             .max_tokens = max_tokens,
+            .reset_cache = reset_cache,
         };
         try ranked_queue.push(task);
-        std.debug.print("Task {s} queued directly (skip ranking, max_tokens={d})\n", .{ id_str, max_tokens });
+        std.debug.print("Task {s} queued directly (skip ranking, max_tokens={d}, reset_cache={})\n", .{ id_str, max_tokens, reset_cache });
     }
 }
 
@@ -886,6 +997,43 @@ fn sendCallbackResult(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+test "parsePriority - detects each level" {
+    try std.testing.expectEqual(scheduler.Priority.critical, parsePriority("PRIORITY: CRITICAL\nREDACTED: hello"));
+    try std.testing.expectEqual(scheduler.Priority.high, parsePriority("PRIORITY: HIGH\nREDACTED: hello"));
+    try std.testing.expectEqual(scheduler.Priority.low, parsePriority("PRIORITY: LOW\nREDACTED: hello"));
+    try std.testing.expectEqual(scheduler.Priority.normal, parsePriority("PRIORITY: NORMAL\nREDACTED: hello"));
+}
+
+test "parsePriority - defaults to normal on garbage" {
+    try std.testing.expectEqual(scheduler.Priority.normal, parsePriority("not a real response"));
+}
+
+test "parseRedacted - extracts text after marker" {
+    const allocator = std.testing.allocator;
+    const response = "PRIORITY: NORMAL\nREDACTED: Email me at [EMAIL] about the order";
+    const redacted = parseRedacted(allocator, response).?;
+    defer allocator.free(redacted);
+    try std.testing.expectEqualStrings("Email me at [EMAIL] about the order", redacted);
+}
+
+test "parseRedacted - trims whitespace" {
+    const allocator = std.testing.allocator;
+    const response = "PRIORITY: NORMAL\nREDACTED:   spaced out text  \n\n";
+    const redacted = parseRedacted(allocator, response).?;
+    defer allocator.free(redacted);
+    try std.testing.expectEqualStrings("spaced out text", redacted);
+}
+
+test "parseRedacted - returns null when marker missing" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(parseRedacted(allocator, "PRIORITY: NORMAL\nno marker here") == null);
+}
+
+test "parseRedacted - returns null when marker has nothing after it" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(parseRedacted(allocator, "PRIORITY: NORMAL\nREDACTED:   \n") == null);
+}
 
 test "server config defaults" {
     var config = cli.Config.init(std.testing.allocator);

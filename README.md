@@ -195,6 +195,22 @@ zig build -Doptimize=ReleaseFast
 | Linux | Unix Socket | ✅ Supported |
 | Windows | Named Pipe | ✅ Comptime Ready |
 
+## Benchmarks
+
+Tested with [l8-bench](https://github.com/rjpruitt16/l8-bench) on Apple M3 Max (CPU inference, TinyLlama 1.1B Q4_K_M):
+
+| Difficulty | Requests | Max Tokens | Decisions/sec | Latency p50 | Latency avg | Success Rate |
+|------------|----------|------------|---------------|-------------|-------------|--------------|
+| Low        | 10       | 8          | 3.1           | 281ms       | 321ms       | 100%         |
+| Medium     | 20       | 64         | 0.5           | 2038ms      | 2077ms      | 100%         |
+
+Run your own benchmark:
+
+```bash
+pip install l8-bench
+l8-bench run -n 10 -d low
+```
+
 ## Why Zig?
 
 - **Single static binary** - No runtime dependencies

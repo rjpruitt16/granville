@@ -3,12 +3,16 @@ const download = @import("download.zig");
 const server = @import("server.zig");
 const driver = @import("driver.zig");
 const model_pool = @import("model_pool.zig");
+const manifest_yaml = @import("manifest_yaml.zig");
 
-const VERSION = "0.2.0"; // Multi-model support
+const VERSION = "0.3.0"; // Manifest support
 
 pub const Command = enum {
     download,
     serve,
+    up,
+    down,
+    pull,
     driver_install,
     driver_list,
     driver_remove,
@@ -30,6 +34,10 @@ pub const Config = struct {
     driver_name: ?[]const u8 = null,
     // Driver options
     driver_backend: []const u8 = "granville-llama",
+    // Manifest options
+    manifest_path: []const u8 = "manifest.yaml",
+    // Logging options
+    verbose: bool = false, // Log full prompts and responses
 
     pub fn init(allocator: std.mem.Allocator) Config {
         return .{
@@ -110,6 +118,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 return error.MissingArgument;
             }
         },
+        .up => {
+            try runUp(allocator, config.manifest_path);
+        },
+        .down => {
+            try runDown(allocator);
+        },
+        .pull => {
+            try runPull(allocator, config.manifest_path);
+        },
         .help => printUsage(),
         .version => printVersion(),
     }
@@ -155,6 +172,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     if (args.next()) |workers_str| {
                         config.num_workers = std.fmt.parseInt(usize, workers_str, 10) catch null;
                     }
+                } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-V")) {
+                    config.verbose = true;
                 } else if (!std.mem.startsWith(u8, arg, "-")) {
                     // It's a model spec (path or type:id:path format)
                     try config.model_specs.append(allocator, model_pool.ModelSpec.parse(arg));
@@ -183,6 +202,24 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             } else {
                 config.command = .driver_list;
             }
+        } else if (std.mem.eql(u8, cmd, "up")) {
+            config.command = .up;
+            // Optional manifest path
+            if (args.next()) |path| {
+                if (!std.mem.startsWith(u8, path, "-")) {
+                    config.manifest_path = path;
+                }
+            }
+        } else if (std.mem.eql(u8, cmd, "down")) {
+            config.command = .down;
+        } else if (std.mem.eql(u8, cmd, "pull")) {
+            config.command = .pull;
+            // Optional manifest path
+            if (args.next()) |path| {
+                if (!std.mem.startsWith(u8, path, "-")) {
+                    config.manifest_path = path;
+                }
+            }
         } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
             config.command = .help;
         } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
@@ -204,14 +241,19 @@ fn printUsage() void {
         \\    granville <command> [options]
         \\
         \\COMMANDS:
-        \\    download <url>         Download a GGUF model from Hugging Face
+        \\    up [manifest.yaml]     Start server from manifest (default: manifest.yaml)
+        \\    down                   Stop the running server
+        \\    pull [manifest.yaml]   Download models defined in manifest
         \\    serve <models...>      Start the inference server with one or more models
+        \\    download <url>         Download a GGUF model from Hugging Face
         \\    driver <subcommand>    Manage inference drivers
         \\    help                   Show this help message
         \\    version                Show version information
         \\
-        \\DOWNLOAD OPTIONS:
-        \\    <url>                  Hugging Face URL to GGUF model file
+        \\MANIFEST COMMANDS:
+        \\    up                     Load manifest.yaml, download models, start server
+        \\    down                   Stop server and cleanup socket
+        \\    pull                   Download models without starting server
         \\
         \\SERVE OPTIONS:
         \\    <models...>            One or more model specs (see MODEL SPEC FORMAT below)
@@ -220,6 +262,7 @@ fn printUsage() void {
         \\    -q, --queue-size <n>   Maximum queue size (default: 1000)
         \\    -w, --workers <n>      Number of worker threads (default: min(num_models, 8))
         \\    -d, --driver <name>    Inference driver to use (default: granville-llama)
+        \\    -V, --verbose          Log full prompts and responses to stderr
         \\
         \\MODEL SPEC FORMAT:
         \\    path.gguf              Simple path (type=unassigned, id=auto)
@@ -232,14 +275,151 @@ fn printUsage() void {
         \\    driver remove <name>   Remove an installed driver
         \\
         \\EXAMPLES:
-        \\    granville download https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_K_M.gguf
-        \\    granville driver install granville-llama
-        \\    granville serve model.gguf
-        \\    granville serve model1.gguf model2.gguf model3.gguf
-        \\    granville serve inference:main:llama.gguf stt:whisper:whisper.gguf
+        \\    granville up                                    # Start from manifest.yaml
+        \\    granville up my-config.yaml                     # Start from custom manifest
+        \\    granville pull                                  # Download models only
+        \\    granville down                                  # Stop server
+        \\    granville serve model.gguf                      # Direct serve
+        \\    granville driver install granville-llama        # Install driver
         \\
     ;
     std.debug.print("{s}", .{usage});
+}
+
+/// Start server from manifest.yaml
+fn runUp(allocator: std.mem.Allocator, manifest_path: []const u8) !void {
+    std.debug.print("\n[1/4] Loading manifest: {s}\n", .{manifest_path});
+
+    var manifest = manifest_yaml.loadFromFile(allocator, manifest_path) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("Error: {s} not found\n", .{manifest_path});
+            std.debug.print("Create a manifest.yaml or specify a path: granville up <path>\n", .{});
+            return err;
+        }
+        return err;
+    };
+    defer manifest.deinit(allocator);
+
+    std.debug.print("  Name: {s} v{s}\n", .{ manifest.name, manifest.version });
+    std.debug.print("  Models: {d}\n", .{manifest.models.count()});
+
+    // Check/download models
+    std.debug.print("\n[2/4] Checking models...\n", .{});
+    var model_specs = std.ArrayList(model_pool.ModelSpec).empty;
+    defer model_specs.deinit(allocator);
+
+    var it = manifest.models.iterator();
+    while (it.next()) |entry| {
+        const model_name = entry.key_ptr.*;
+        const model_config = entry.value_ptr.*;
+
+        const local_path = try manifest_yaml.resolveModelPath(allocator, model_config.source);
+
+        if (std.fs.cwd().access(local_path, .{})) {
+            std.debug.print("  ✓ {s}: exists\n", .{model_name});
+        } else |_| {
+            if (std.mem.startsWith(u8, model_config.source, "huggingface://")) {
+                std.debug.print("  ↓ {s}: downloading...\n", .{model_name});
+                const url = try manifest_yaml.huggingfaceToUrl(allocator, model_config.source);
+                defer allocator.free(url);
+                try download.downloadModel(allocator, url);
+                std.debug.print("  ✓ {s}: downloaded\n", .{model_name});
+            } else {
+                std.debug.print("  ✗ {s}: not found\n", .{model_name});
+                return error.ModelNotFound;
+            }
+        }
+
+        try model_specs.append(allocator, .{
+            .path = local_path,
+            .model_type = model_config.model_type,
+            .id = null,
+        });
+    }
+
+    // Install driver
+    std.debug.print("\n[3/4] Checking driver...\n", .{});
+    var driver_manager = try driver.DriverManager.init(allocator);
+    defer driver_manager.deinit();
+    driver_manager.install(manifest.driver_name) catch |err| {
+        if (err != error.AlreadyInstalled) return err;
+    };
+    std.debug.print("  ✓ {s}\n", .{manifest.driver_name});
+
+    // Start server
+    std.debug.print("\n[4/4] Starting server...\n", .{});
+    std.debug.print("  Socket: {s}\n", .{manifest.server_config.socket_path});
+    std.debug.print("  Port: {d}\n", .{manifest.server_config.port});
+
+    var cli_config = Config.init(allocator);
+    cli_config.command = .serve;
+    cli_config.model_specs = model_specs;
+    cli_config.socket_path = manifest.server_config.socket_path;
+    cli_config.port = manifest.server_config.port;
+    cli_config.queue_size = manifest.server_config.queue_size;
+    cli_config.num_workers = manifest.server_config.workers;
+    cli_config.driver_backend = manifest.driver_name;
+
+    std.debug.print("\nServer ready. Waiting for connections...\n\n", .{});
+    try server.start(allocator, cli_config);
+}
+
+/// Stop running server
+fn runDown(_: std.mem.Allocator) !void {
+    const socket_path = "/tmp/granville.sock";
+
+    std.debug.print("Stopping Granville server...\n", .{});
+
+    // Remove socket file
+    std.fs.cwd().deleteFile(socket_path) catch |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("Warning: Could not remove socket: {s}\n", .{socket_path});
+        }
+    };
+
+    // Note: In a full implementation, we'd send a shutdown signal
+    // For now, removing the socket is the cleanup step
+    std.debug.print("  ✓ Socket removed: {s}\n", .{socket_path});
+    std.debug.print("\nTo fully stop, also kill the granville process:\n", .{});
+    std.debug.print("  pkill -f 'granville serve'\n", .{});
+}
+
+/// Download models from manifest without starting server
+fn runPull(allocator: std.mem.Allocator, manifest_path: []const u8) !void {
+    std.debug.print("Pulling models from: {s}\n\n", .{manifest_path});
+
+    var manifest = manifest_yaml.loadFromFile(allocator, manifest_path) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("Error: {s} not found\n", .{manifest_path});
+            return err;
+        }
+        return err;
+    };
+    defer manifest.deinit(allocator);
+
+    var it = manifest.models.iterator();
+    while (it.next()) |entry| {
+        const model_name = entry.key_ptr.*;
+        const model_config = entry.value_ptr.*;
+
+        const local_path = try manifest_yaml.resolveModelPath(allocator, model_config.source);
+
+        if (std.fs.cwd().access(local_path, .{})) {
+            std.debug.print("✓ {s}: already downloaded\n", .{model_name});
+        } else |_| {
+            if (std.mem.startsWith(u8, model_config.source, "huggingface://")) {
+                std.debug.print("↓ {s}: downloading...\n", .{model_name});
+                const url = try manifest_yaml.huggingfaceToUrl(allocator, model_config.source);
+                defer allocator.free(url);
+                try download.downloadModel(allocator, url);
+                std.debug.print("✓ {s}: downloaded\n", .{model_name});
+            } else {
+                std.debug.print("✗ {s}: not found at {s}\n", .{ model_name, local_path });
+            }
+        }
+    }
+
+    std.debug.print("\nDone.\n", .{});
 }
 
 fn printVersion() void {

@@ -207,69 +207,83 @@ The driver registry evolves in stages:
 
 ---
 
-## Day 2 Roadmap
+## Completed Features
 
-### 1. Multi-Model Load Balancing
+### Multi-Model Load Balancing ✅
 
-Support multiple models on one socket with sticky sessions.
+Multiple models on one socket with sticky sessions is **fully implemented**.
 
 **CLI:**
 ```bash
-granville serve model1.gguf,model2.gguf,model3.gguf --strategy round-robin
-# or
-granville serve --models "ranker:tiny.gguf,main:llama7b.gguf"
+granville serve model1.gguf model2.gguf model3.gguf  # Load multiple models
+granville serve "inference:model.gguf"               # With model type
+granville serve "inference:1:model.gguf"             # With explicit ID
 ```
 
-**Protocol additions:**
+**Protocol (implemented):**
 ```json
 // Request
 {
   "id": "uuid",
   "text": "input",
   "callback": "/tmp/client.sock",
-  "model_id": null,        // null = load balancer picks, or "llama-a1b2c3" for sticky
-  "session_id": null       // for KV cache reuse (future)
+  "model_id": null,        // null = load balancer picks, or 1/2/3 for sticky routing
+  "max_tokens": 256
 }
 
 // Response (includes model_id for sticky routing)
 {
   "id": "uuid",
-  "model_id": "llama-a1b2c3",
+  "model_id": 1,           // Integer ID of model that handled request
   "tool_id": "__chat__",
   "tool_input_json": "[\"response\"]",
-  "priority": "NORMAL"
+  "priority": "normal"
 }
 ```
 
-**Model Registry API:**
+**Implementation:**
+- `model_pool.zig`: ModelPool with least-busy routing (`acquireLeastBusy`)
+- Model types: inference, stt, tts, embedding, unassigned
+- Sticky sessions via `model_id` field in requests/responses
+- Active request tracking for load balancing
+- Multiple worker threads (default: min(num_models, 8))
+
+### GPU Support (granville-llama) ✅
+
+Metal (macOS) acceleration is **enabled** in the granville-llama driver.
+
+**Environment variables:**
+```bash
+GRANVILLE_LLAMA_GPU_LAYERS=35   # Layers to offload (0 = CPU only)
+GRANVILLE_LLAMA_CONTEXT=2048    # Context size
+GRANVILLE_LLAMA_THREADS=8       # CPU threads
+```
+
+---
+
+## Future Roadmap
+
+### 1. KV Cache Session Persistence
+
+Enable session_id for KV cache reuse across requests (conversation continuity).
+
 ```json
-// GET /models or query via socket
+{
+  "session_id": "user-abc123"    // for KV cache reuse
+}
+```
+
+### 2. Model Registry HTTP API
+
+Expose model list/status via HTTP endpoint.
+
+```json
+// GET /models
 {
   "models": [
-    {"id": "llama-a1b2c3", "type": "inference", "path": "llama7b.gguf", "busy": false},
-    {"id": "whisper-x1y2", "type": "stt", "path": "whisper.gguf", "busy": true}
+    {"id": 1, "type": "inference", "path": "llama7b.gguf", "active_requests": 0},
+    {"id": 2, "type": "stt", "path": "whisper.gguf", "active_requests": 1}
   ]
-}
-```
-
-### 2. GPU Support (granville-llama)
-
-Enable Metal (macOS) / CUDA (Linux) acceleration.
-
-**Build llama.cpp with GPU:**
-```bash
-# macOS Metal
-cmake -B build -DLLAMA_METAL=ON -DCMAKE_BUILD_TYPE=Release
-
-# Linux CUDA
-cmake -B build -DLLAMA_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-```
-
-**Driver config additions:**
-```json
-{
-  "gpu_layers": 35,      // layers to offload to GPU (0 = CPU only)
-  "context_size": 4096
 }
 ```
 
@@ -329,9 +343,10 @@ pub fn execute(workflow: *Workflow, ctx: *Context) !void {
 
 ### Implementation Order
 
-1. **Model Pool** - load multiple models, assign IDs
-2. **Load Balancer** - round-robin/least-busy routing
-3. **Sticky Sessions** - track model_id per session_id
-4. **Model Registry API** - expose model list/status
-5. **GPU build** - rebuild granville-llama with Metal
-6. **Crucible scaffold** - new repo, basic executor
+1. ~~**Model Pool** - load multiple models, assign IDs~~ ✅
+2. ~~**Load Balancer** - round-robin/least-busy routing~~ ✅
+3. ~~**Sticky Sessions** - track model_id per request/response~~ ✅
+4. **Model Registry HTTP API** - expose model list/status via HTTP
+5. ~~**GPU build** - rebuild granville-llama with Metal~~ ✅
+6. **KV Cache Sessions** - track session_id for cache reuse
+7. **Crucible scaffold** - new repo, basic executor
