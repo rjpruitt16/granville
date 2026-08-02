@@ -324,6 +324,30 @@ const ServerContext = struct {
         return error.ModelNotLoaded;
     }
 
+    /// Same as generateWithRouting, but on_token fires once per token as
+    /// the model produces it, instead of only returning at the end.
+    fn generateStreamWithRouting(
+        self: *ServerContext,
+        requested_model_id: ?u32,
+        prompt: []const u8,
+        max_tokens: u32,
+        reset_cache: bool,
+        on_token: driver_mod.TokenCallback,
+        userdata: ?*anyopaque,
+    ) !InferenceResult {
+        if (self.pool) |*pool| {
+            const model = if (requested_model_id) |id|
+                pool.getById(id) orelse return error.ModelNotFound
+            else
+                pool.acquireLeastBusy(null) orelse return error.NoModelsAvailable;
+
+            defer pool.markIdle(model);
+            const response = try pool.generateStream(model, prompt, max_tokens, reset_cache, on_token, userdata);
+            return .{ .response = response, .model_id = model.id };
+        }
+        return error.ModelNotLoaded;
+    }
+
     /// Rank a task: classify its priority AND redact PII, returning the
     /// redacted text that should actually be used for inference. Falls back
     /// to the original text (never blocks the request) if the model errors
@@ -561,10 +585,29 @@ fn workerThread(ctx: *ThreadContext) void {
                 std.debug.print("\n[PROMPT] task={s}\n{s}\n[/PROMPT]\n\n", .{ task.id, task.text });
             }
 
+            // Callback connection is opened once and held for the whole
+            // task: token deltas stream over it as they're generated, then
+            // the final result (or an error) closes it out. If we can't
+            // even connect, there's nowhere to report that -- just move on.
+            var conn = ipc.connect(task.callback) catch |err| {
+                std.debug.print("[worker-{d}] Failed to connect to callback {s}: {}\n", .{ ctx.worker_id, task.callback, err });
+                continue;
+            };
+            defer conn.close();
+
+            var stream_ctx = StreamCtx{ .allocator = ctx.allocator, .conn = &conn, .id = task.id };
+
             // Run inference with routing (uses requested model_id or least-busy, respects reset_cache flag)
-            const result = ctx.server_ctx.generateWithRouting(task.model_id, task.text, task.max_tokens, task.reset_cache) catch |err| {
+            const result = ctx.server_ctx.generateStreamWithRouting(
+                task.model_id,
+                task.text,
+                task.max_tokens,
+                task.reset_cache,
+                onTokenChunk,
+                &stream_ctx,
+            ) catch |err| {
                 std.debug.print("[worker-{d}] Inference failed: {}\n", .{ ctx.worker_id, err });
-                sendCallbackError(ctx.allocator, task.callback, task.id, "inference_failed", .internal_error) catch {};
+                sendErrorOnConn(ctx.allocator, &conn, task.id, "inference_failed", .internal_error) catch {};
                 continue;
             };
             defer ctx.server_ctx.freeString(result.response);
@@ -579,19 +622,21 @@ fn workerThread(ctx: *ThreadContext) void {
             // Format response as JSON array (with proper escaping)
             var escape_buf: [65536]u8 = undefined; // 2x json_buf for worst-case escaping
             const escaped = jsonEscapeString(result.response, &escape_buf) catch {
-                sendCallbackError(ctx.allocator, task.callback, task.id, "response_too_long", .internal_error) catch {};
+                sendErrorOnConn(ctx.allocator, &conn, task.id, "response_too_long", .internal_error) catch {};
                 continue;
             };
 
             var json_buf: [65536]u8 = undefined;
             const json_response = std.fmt.bufPrint(&json_buf, "[\"{s}\"]", .{escaped}) catch {
-                sendCallbackError(ctx.allocator, task.callback, task.id, "response_too_long", .internal_error) catch {};
+                sendErrorOnConn(ctx.allocator, &conn, task.id, "response_too_long", .internal_error) catch {};
                 continue;
             };
 
-            // Send result to callback (includes model_id for sticky routing)
-            sendCallbackResult(ctx.allocator, task.callback, task.id, result.model_id, "__chat__", json_response, task.priority.toString()) catch |err| {
-                std.debug.print("[worker-{d}] Failed to send callback: {}\n", .{ ctx.worker_id, err });
+            // Send the final result on the same connection (includes
+            // model_id for sticky routing) -- this is what marks the
+            // stream complete on the client side.
+            sendResultOnConn(ctx.allocator, &conn, task.id, result.model_id, "__chat__", json_response, task.priority.toString()) catch |err| {
+                std.debug.print("[worker-{d}] Failed to send final result: {}\n", .{ ctx.worker_id, err });
             };
         } else {
             // No tasks, sleep briefly
@@ -920,7 +965,7 @@ fn sendErrorResponseConn(
     _ = try connection.write(write_buf[0..written]);
 }
 
-/// Send error to callback via IPC
+/// Send error to callback via IPC (opens its own connection)
 fn sendCallbackError(
     allocator: std.mem.Allocator,
     callback_path: []const u8,
@@ -928,13 +973,24 @@ fn sendCallbackError(
     err_msg: []const u8,
     code: protocol.ErrorCode,
 ) !void {
-    // Connect to callback using platform IPC
     var conn = ipc.connect(callback_path) catch |err| {
         std.debug.print("Failed to connect to callback {s}: {}\n", .{ callback_path, err });
         return err;
     };
     defer conn.close();
+    try sendErrorOnConn(allocator, &conn, id, err_msg, code);
+}
 
+/// Send error on an already-open callback connection (streaming worker path,
+/// where the connection is opened once up front and reused for every
+/// message -- chunks, and finally either a result or an error).
+fn sendErrorOnConn(
+    allocator: std.mem.Allocator,
+    conn: *ipc.Connection,
+    id: []const u8,
+    err_msg: []const u8,
+    code: protocol.ErrorCode,
+) !void {
     var write_buf: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&write_buf);
     var read_buf: [1]u8 = undefined;
@@ -954,7 +1010,7 @@ fn sendCallbackError(
     _ = try conn.write(write_buf[0..written]);
 }
 
-/// Send result to callback via IPC
+/// Send result to callback via IPC (opens its own connection)
 fn sendCallbackResult(
     allocator: std.mem.Allocator,
     callback_path: []const u8,
@@ -964,13 +1020,27 @@ fn sendCallbackResult(
     tool_input_json: []const u8,
     priority: []const u8,
 ) !void {
-    // Connect to callback using platform IPC
     var conn = ipc.connect(callback_path) catch |err| {
         std.debug.print("Failed to connect to callback {s}: {}\n", .{ callback_path, err });
         return err;
     };
     defer conn.close();
+    try sendResultOnConn(allocator, &conn, id, model_id, tool_id, tool_input_json, priority);
+    std.debug.print("Sent result to callback {s} (model_id: {d})\n", .{ callback_path, model_id });
+}
 
+/// Send the final result on an already-open callback connection. Still
+/// carries the full accumulated text (not just a "done" marker) so a
+/// client that missed/dropped delta chunks still gets a complete answer.
+fn sendResultOnConn(
+    allocator: std.mem.Allocator,
+    conn: *ipc.Connection,
+    id: []const u8,
+    model_id: u32,
+    tool_id: []const u8,
+    tool_input_json: []const u8,
+    priority: []const u8,
+) !void {
     var write_buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&write_buf);
     var read_buf: [1]u8 = undefined;
@@ -990,8 +1060,52 @@ fn sendCallbackResult(
 
     const written = writer.end;
     _ = try conn.write(write_buf[0..written]);
+}
 
-    std.debug.print("Sent result to callback {s} (model_id: {d})\n", .{ callback_path, model_id });
+/// Send one token delta on an already-open callback connection. Sent
+/// repeatedly during generation, before the final sendResultOnConn/
+/// sendErrorOnConn message that closes out the task.
+fn sendChunkOnConn(
+    allocator: std.mem.Allocator,
+    conn: *ipc.Connection,
+    id: []const u8,
+    delta: []const u8,
+) !void {
+    var write_buf: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&write_buf);
+    var read_buf: [1]u8 = undefined;
+    var reader = std.Io.Reader.fixed(&read_buf);
+    var packer = msgpack.PackerIO.init(&reader, &writer);
+
+    var response = msgpack.Payload.mapPayload(allocator);
+    defer response.free(allocator);
+
+    try response.mapPut("id", try msgpack.Payload.strToPayload(id, allocator));
+    try response.mapPut("delta", try msgpack.Payload.strToPayload(delta, allocator));
+
+    try packer.write(response);
+
+    const written = writer.end;
+    _ = try conn.write(write_buf[0..written]);
+}
+
+/// Threaded through generateStreamWithRouting's C-ABI callback as userdata
+/// so onTokenChunk (which must be a plain fn, not a closure, to cross the
+/// driver's C ABI) can reach the open connection and task id.
+const StreamCtx = struct {
+    allocator: std.mem.Allocator,
+    conn: *ipc.Connection,
+    id: []const u8,
+};
+
+fn onTokenChunk(userdata: ?*anyopaque, piece: [*:0]const u8) callconv(.c) void {
+    const stream_ctx: *StreamCtx = @ptrCast(@alignCast(userdata orelse return));
+    const piece_slice = std.mem.span(piece);
+    if (piece_slice.len == 0) return;
+
+    sendChunkOnConn(stream_ctx.allocator, stream_ctx.conn, stream_ctx.id, piece_slice) catch |err| {
+        std.debug.print("Failed to send stream chunk: {}\n", .{err});
+    };
 }
 
 // ============================================================================

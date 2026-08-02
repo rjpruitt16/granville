@@ -212,6 +212,19 @@ pub const ModelPool = struct {
         return self.driver.generate(model.handle, prompt, max_tokens, reset_cache);
     }
 
+    /// Same as generate, but on_token fires once per token as it's produced.
+    pub fn generateStream(
+        self: *ModelPool,
+        model: *Model,
+        prompt: []const u8,
+        max_tokens: u32,
+        reset_cache: bool,
+        on_token: driver_mod.TokenCallback,
+        userdata: ?*anyopaque,
+    ) ![]const u8 {
+        return self.driver.generateStream(model.handle, prompt, max_tokens, reset_cache, on_token, userdata);
+    }
+
     /// Free a string returned by generate
     pub fn freeString(self: *ModelPool, str: []const u8) void {
         self.driver.freeString(str);

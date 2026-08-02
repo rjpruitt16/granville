@@ -63,6 +63,10 @@ pub const RegistryEntry = struct {
     latest_version: []const u8,
 };
 
+/// Called once per generated token when streaming via generate_stream.
+/// `piece` is only valid for the duration of the call.
+pub const TokenCallback = *const fn (?*anyopaque, [*:0]const u8) callconv(.c) void;
+
 /// The interface that all drivers must export
 /// These are the C function signatures that drivers implement
 pub const DriverVTable = extern struct {
@@ -82,6 +86,11 @@ pub const DriverVTable = extern struct {
     /// Returns pointer to null-terminated string (caller must free with free_string)
     /// @param reset_cache: if true, clear KV cache before inference (for independent requests)
     generate: *const fn (?*anyopaque, ?*anyopaque, [*:0]const u8, u32, bool) callconv(.c) [*:0]const u8,
+
+    /// Same as generate, but calls on_token once per generated token as
+    /// it's produced instead of only returning the full text at the end.
+    /// Still returns the full text too (same contract as generate).
+    generate_stream: *const fn (?*anyopaque, ?*anyopaque, [*:0]const u8, u32, bool, TokenCallback, ?*anyopaque) callconv(.c) [*:0]const u8,
 
     /// Free a string returned by generate
     free_string: *const fn ([*:0]const u8) callconv(.c) void,
@@ -124,6 +133,32 @@ pub const Driver = struct {
 
         const result = self.vtable.generate(self.context, model, prompt_buf[0..prompt.len :0], max_tokens, reset_cache);
         // Return as slice (caller should copy if needed, then call freeString)
+        return std.mem.span(result);
+    }
+
+    pub fn generateStream(
+        self: *Driver,
+        model: *anyopaque,
+        prompt: []const u8,
+        max_tokens: u32,
+        reset_cache: bool,
+        on_token: TokenCallback,
+        userdata: ?*anyopaque,
+    ) ![]const u8 {
+        var prompt_buf: [32768]u8 = undefined;
+        if (prompt.len >= prompt_buf.len) return error.PromptTooLong;
+        @memcpy(prompt_buf[0..prompt.len], prompt);
+        prompt_buf[prompt.len] = 0;
+
+        const result = self.vtable.generate_stream(
+            self.context,
+            model,
+            prompt_buf[0..prompt.len :0],
+            max_tokens,
+            reset_cache,
+            on_token,
+            userdata,
+        );
         return std.mem.span(result);
     }
 
