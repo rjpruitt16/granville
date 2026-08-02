@@ -15,6 +15,7 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: linux-x86_64
@@ -23,11 +24,12 @@ jobs:
           - target: linux-aarch64
             os: ubuntu-latest
             zig_target: aarch64-linux-gnu
+          # Pinned rather than macos-latest: see ci.yml for why.
           - target: macos-x86_64
-            os: macos-latest
+            os: macos-14
             zig_target: x86_64-macos
           - target: macos-aarch64
-            os: macos-latest
+            os: macos-14
             zig_target: aarch64-macos
           - target: windows-x86_64
             os: ubuntu-latest

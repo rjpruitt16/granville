@@ -229,7 +229,10 @@ pub fn resolveModelPath(allocator: std.mem.Allocator, source: []const u8) ![]con
     if (std.mem.startsWith(u8, source, "huggingface://")) {
         const last_slash = std.mem.lastIndexOf(u8, source, "/") orelse return error.InvalidSource;
         const filename = source[last_slash + 1 ..];
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        // std.posix.getenv doesn't work on Windows (env strings are WTF-16
+        // there); getEnvVarOwned is the cross-platform equivalent.
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch try allocator.dupe(u8, "/tmp");
+        defer allocator.free(home);
         return std.fmt.allocPrint(allocator, "{s}/.granville/models/{s}", .{ home, filename });
     }
     return allocator.dupe(u8, source);

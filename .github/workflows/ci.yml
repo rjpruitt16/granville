@@ -12,8 +12,13 @@ jobs:
     name: Build & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macos-latest pinned to a specific version rather than the rolling
+        # alias: a macos-latest image update broke Zig 0.15.2's native
+        # linking (undefined libSystem symbols) with no code change on our
+        # side, and silently failed every job in the matrix via fail-fast.
+        os: [ubuntu-latest, macos-14]
 
     steps:
       - uses: actions/checkout@v4
