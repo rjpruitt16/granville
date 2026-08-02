@@ -31,9 +31,6 @@ jobs:
           - target: macos-aarch64
             os: macos-14
             zig_target: aarch64-macos
-          - target: windows-x86_64
-            os: ubuntu-latest
-            zig_target: x86_64-windows-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -48,15 +45,9 @@ jobs:
       - name: Build Release Binary
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast
 
-      - name: Rename binary (Unix)
-        if: matrix.target != 'windows-x86_64'
+      - name: Rename binary
         run: |
           mv zig-out/bin/granville granville-${{ matrix.target }}
-
-      - name: Rename binary (Windows)
-        if: matrix.target == 'windows-x86_64'
-        run: |
-          mv zig-out/bin/granville.exe granville-${{ matrix.target }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -89,7 +80,6 @@ jobs:
           cp artifacts/granville-linux-aarch64/granville-linux-aarch64 release/
           cp artifacts/granville-macos-x86_64/granville-macos-x86_64 release/
           cp artifacts/granville-macos-aarch64/granville-macos-aarch64 release/
-          cp artifacts/granville-windows-x86_64/granville-windows-x86_64.exe release/
           chmod +x release/granville-*
           ls -la release/
 

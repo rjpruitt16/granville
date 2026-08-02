@@ -122,6 +122,3 @@ jobs:
 
       - name: Build for Linux ARM64
         run: zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
-
-      - name: Build for Windows x86_64
-        run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast

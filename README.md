@@ -193,7 +193,8 @@ zig build -Doptimize=ReleaseFast
 |----------|-----------|--------|
 | macOS | Unix Socket | ✅ Supported |
 | Linux | Unix Socket | ✅ Supported |
-| Windows | Named Pipe | ✅ Comptime Ready |
+
+Not targeting Windows — the CI/release pipeline builds and tests macOS and Linux only. A `WindowsNamedPipe` code path exists in `server.zig` but has never been exercised by CI or a real Windows machine; treat it as unmaintained, not supported.
 
 ## Benchmarks
 
